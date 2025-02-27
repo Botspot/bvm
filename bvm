@@ -539,9 +539,9 @@ update_check() { #check for updates and reload the script if necessary
 copy_icons() { #install icons to a location where the panel will notice them
   mkdir -p ~/.local/share/icons/hicolor/scalable/apps
   if [ ! -f ~/.local/share/icons/hicolor/scalable/apps/wlfreerdp.png ];then
-    ln -sf "$DIRECTORY/resources/icon.png" ~/.local/share/icons/hicolor/scalable/apps/qemu.png
-    ln -sf "$DIRECTORY/resources/icon.png" ~/.local/share/icons/hicolor/scalable/apps/wlfreerdp.png
-    ln -sf "$DIRECTORY/resources/icon.png" ~/.local/share/icons/hicolor/scalable/apps/xfreerdp.png
+    ln -sf "$DIRECTORY/resources/icons/icon.png" ~/.local/share/icons/hicolor/scalable/apps/qemu.png
+    ln -sf "$DIRECTORY/resources/icons/icon.png" ~/.local/share/icons/hicolor/scalable/apps/wlfreerdp.png
+    ln -sf "$DIRECTORY/resources/icons/icon.png" ~/.local/share/icons/hicolor/scalable/apps/xfreerdp.png
   fi
   #for wf-panel-pi at least, updating icon caches seems to do no good
 }
@@ -833,14 +833,14 @@ To get a fresh VM up and running, use a sequence like this:
     #the window freezes while running a task, and wayland times it out, so run on xwayland
     # <a href="\""https://github.com/sponsors/botspot"\"">Support Botspot</a>
     GDK_BACKEND=x11 yad --class wlfreerdp --name wlfreerdp --title "BVM" --form --center --width 400 \
-      --image "${DIRECTORY}/resources/icon-80.png" --image-on-top --no-buttons \
+      --image "${DIRECTORY}/resources/icons/icon-80.png" --image-on-top --no-buttons \
       --text="Botspot Virtual Machine, at your service.$([ "$vmdir" != "$HOME/win11" ] && echo -e "\nvmdir: <u>$vmdir</u>")" \
-      --field="<b>New Virtual Machine</b>!${DIRECTORY}/resources/1.png":FBTN "@bash -c 'clickhandler newvm'" \
-      --field="<b>Edit configuration file</b>!${DIRECTORY}/resources/2.png":FBTN "$initial_button2" \
-      --field="<b>Download components</b>!${DIRECTORY}/resources/3.png":FBTN "$initial_button3" \
-      --field="<b>Prepare for installation</b>!${DIRECTORY}/resources/4.png":FBTN "$initial_button4" \
-      --field="<b>Install Windows 11</b>!${DIRECTORY}/resources/5.png":FBTN "$initial_button5" \
-      --field="<b>Run Windows 11</b>!${DIRECTORY}/resources/6.png":FBTN "$initial_button6" \
+      --field="<b>New Virtual Machine</b>!${DIRECTORY}/resources/icons/1.png":FBTN "@bash -c 'clickhandler newvm'" \
+      --field="<b>Edit configuration file</b>!${DIRECTORY}/resources/icons/2.png":FBTN "$initial_button2" \
+      --field="<b>Download components</b>!${DIRECTORY}/resources/icons/3.png":FBTN "$initial_button3" \
+      --field="<b>Prepare for installation</b>!${DIRECTORY}/resources/icons/4.png":FBTN "$initial_button4" \
+      --field="<b>Install Windows 11</b>!${DIRECTORY}/resources/icons/5.png":FBTN "$initial_button5" \
+      --field="<b>Run Windows 11</b>!${DIRECTORY}/resources/icons/6.png":FBTN "$initial_button6" \
       --field="Viewing mode":CB "Direct!^FreeRDP!Remmina"
     ;;
   new-vm)
