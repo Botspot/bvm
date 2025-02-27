@@ -1,9 +1,9 @@
 # BVM
-Windows 11 Virtual Machine on ARM Linux
-![20250226_23h09m13s_grim](https://github.com/user-attachments/assets/6cb7d139-8656-4a1e-ab9e-1cdd7d6d6431)  
+ 
 It's ready for beta testers. Please [report](https://github.com/Botspot/bvm/issues) good and bad results. Do not assume I am already aware of an issue, unless you can find it in [Issues](https://github.com/Botspot/bvm/issues), in which case please comment with something like "I'm having this problem too."  
 
 ### What to expect:
+
 - A full Windows 11 ARM virtual machine on ARM Linux. Thanks to [KVM](https://en.wikipedia.org/wiki/Kernel-based_Virtual_Machine), this uses virtualization instead of emulation, resulting in no significant speed difference compared to installing Windows directly.
 - A first-class setup experience. None of the usual sticking points are present here - everything is automated, even setup and debloating.
 - It uses network passthrough to the Linux network stack, so Ethernet and WiFi all work out of the box.
@@ -15,9 +15,11 @@ It's ready for beta testers. Please [report](https://github.com/Botspot/bvm/issu
 - The graphics are snappy and quicker than you would expect, at least with the `connect` mode on Wayland. Youtube and lightweight web games are actually somewhat playable on the Raspberry Pi 5 without any overclocking or extra tweaks.
 
 ### What not to expect:
+
 - A gaming rig. For now there is no graphics acceleration, so 3D features and WebGL won't work. _That could change_ once somebody figures out virtualized graphics that talk to Vulkan. (see "Other Notes" below)
 
 ### Get started:
+
 ```
 git clone https://github.com/Botspot/bvm
 bvm/bvm help
@@ -38,6 +40,7 @@ BVM also makes some icon symlinks in `~/.local/share/icons/hicolor/scalable/apps
 </details>
 
 ### Usage instructions
+
 Read the help message and follow the instructions. BVM has simplified the VM-creation process to a tidy sequence of completely automated steps. Between each step you have the opportunity to change what is happening, modify the config file, retry a step, or do whatever else you want. Unlike some of my other scripts that have a slight "don't try to understand how it all works" philosophy, BVM encourages you to learn it, hack it, and add to it.
 
 To get a fresh VM up and running, use a sequence like this:  
@@ -69,15 +72,37 @@ To get a fresh VM up and running, use a sequence like this:
 
 Full list of modes: `new-vm`, `download`, `prepare`, `firstboot`, `boot`, `connect`, `mount`, `help`, `list-languages`, `boot-nodisplay`, `boot-ramfb`, `boot-gtk`, `connect-freerdp`, `connect-remmina`, `gui`  
 What is that last one there? Oh I almost forgot! ;-)  
-BVM has a graphical user interface.  
-![image](https://github.com/user-attachments/assets/6b4bef4f-b18a-44f0-aba3-1d9ea2f0f34a)  
-Run the GUI with:
+
+### Screenshots
+
+<table class="table">
+  <thead>
+    <tr>
+      <th scope="col" width="1000px">BVM has a graphical user interface</th>
+      <th scope="col" width="1000px">Windows 11 Virtual Machine on ARM Linux</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td>
+        <img src="https://github.com/user-attachments/assets/6b4bef4f-b18a-44f0-aba3-1d9ea2f0f34a" width="100%" alt="BVM has a graphical user interface">
+      </td>
+      <td>
+        <img src="https://github.com/user-attachments/assets/6cb7d139-8656-4a1e-ab9e-1cdd7d6d6431" width="100%" alt="Windows 11 Virtual Machine on ARM Linux">
+      </td>
+    </tr>
+  </tbody>
+</table>
+
+### Run the GUI with:
+
 ```
 bvm/bvm gui
 ```
 Right now it is quite basic, but functional. It might stay that way, might not. Much of BVM's future depends on how much of an impact it makes in the community. If nobody uses it, then I will leave it to rot as with past projects that I thought were cool but nobody else did.  
 
 ### Tips:
+
 - Use an ARM 64-bit Linux OS with the `kvm` kernel module enabled. This is a hard requirement.
 - Use Wayland. This is not a hard requirement, but it makes a big difference.
 - Use ZRAM. This is a must if you have a 1GB or 2GB Pi model. [Instructions here.](https://pi-apps.io/install-app/install-more-ram-on-raspberry-pi/)
@@ -86,6 +111,7 @@ Right now it is quite basic, but functional. It might stay that way, might not. 
 - Encounter an issue? [Open an issue.](https://github.com/Botspot/bvm/issues) Deal? Deal. :)
 
 ### Other notes:
+
 - ~~It seems to not be working on Raspberry Pi 4.~~ Now it should work after [this commit](https://github.com/Botspot/bvm/commit/d0b0a1ff228bbebfc2250b97255048032f3df3c7). Now on devices without A76 CPU cores, Windows 11 version 22631.2861 will be downloaded instead of the most recent stable version. This ought to resolve things for the Pi 4 and likely the Pi 3.
 - If you have past experience with QEMU, I would like to ask for your ongoing help to help build out more features. Surely somebody will want to do serial passthrough, bluetooth passthrough, or something really specific that I will have no idea how to implement.
 - GPU driver: Full 2D/3D acceleration may be possible. First of all if you are Jeff Geerling and have a secondary GPU connected to your Raspberry Pi, in theory Windows could talk to it using GPU passthrough over PCIe. Maybe.  
@@ -95,6 +121,7 @@ Right now it is quite basic, but functional. It might stay that way, might not. 
 - One exciting possibility is the chance to break out individual windows programs and integrate them directly into the linux desktop, using a RDP mode called RemoteApp. See a screenshot of this [here.](https://forums.raspberrypi.com/viewtopic.php?t=384433) Unfortunately it is [very inconsistent](https://github.com/FreeRDP/FreeRDP/issues/11218) right now, and I deemed it too unstable to include as a feature at the moment.
 
 ### Ask me anything!
+
 - Who made this?  
     I'm [Botspot](https://github.com/Botspot), a college student, bash scripter, Raspberry Pi user, and founder of [Pi-Apps](https://github.com/Botspot/pi-apps) and [WoR-Flasher](https://github.com/Botspot/wor-flasher). If you met me in real life you would just see an average kid.  
 - Is this legal?  
