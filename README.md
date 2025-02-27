@@ -1,4 +1,4 @@
-![logo](https://raw.githubusercontent.com/Botspot/bvm/refs/heads/main/resources/graphics/icon-128.png)
+![BVM](https://raw.githubusercontent.com/Botspot/bvm/refs/heads/main/resources/graphics/icon-128.png)  
 Windows 11 Virtual Machine on ARM Linux
 ![20250226_23h09m13s_grim](https://github.com/user-attachments/assets/6cb7d139-8656-4a1e-ab9e-1cdd7d6d6431)  
 It's ready for beta testers. Please [report](https://github.com/Botspot/bvm/issues) good and bad results. Do not assume I am already aware of an issue, unless you can find it in [Issues](https://github.com/Botspot/bvm/issues), in which case please comment with something like "I'm having this problem too."  
