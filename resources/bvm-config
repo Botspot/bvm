@@ -9,8 +9,8 @@
 #This file will be copied to the VM folder when you run bvm new-vm 
 
 #Windows username and password to set during the firstboot mode
-vm_username=Win11ARM
-vm_password=win11arm
+vm_username="Win11ARM"
+vm_password="win11arm"
 #If you change the credentials later, update them here for the connect mode to work.
 
 #Select language. List all languages with: bvm list-languages
