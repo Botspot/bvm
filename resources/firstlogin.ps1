@@ -73,7 +73,7 @@ if (Test-Path $DebloatScript) {
 }
 
 # Shutdown after completion
-Execute-Command 'shutdown.exe -s -t 30 -c "First-run setup complete. This VM will SHUTDOWN in 30 seconds"'
+Execute-Command 'shutdown.exe -s -t 60 -c "First-run setup complete. This VM will SHUTDOWN in 60 seconds"'
 
 # Stop logging
 Stop-Transcript
