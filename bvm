@@ -217,7 +217,7 @@ remove_microsoft_defender() { #given mountpoint on $1, remove microsoft defender
       error "Failed to remove Microsoft Defender from disk.qcow2. Most likely the install was interrupted or the VM encountered an unsafe shutdown."
     fi
     if [ "$defenderfound" == 1 ];then
-      status_green "Successuflly removed Microsoft Defender from disk.qcow2"
+      status_green "Successfully removed Microsoft Defender from disk.qcow2"
     fi
   fi
 }
