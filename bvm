@@ -1312,14 +1312,15 @@ To get a fresh VM up and running, use a sequence like this:
     if ! (mount_qcow2 "$vmdir/disk.qcow2") ;then
       (unmount_qcow2)
       error "It appears that Windows installation was not completed in disk.qcow2. Mounting the hard disk image failed."
-    elif [ ! -f "$mountpoint/Program Files/Qemu-ga/qemu-ga.exe" ];then #check for qemu guest agent to determine if it was fully installed
+    #elif [ ! -f "$mountpoint/Program Files/Qemu-ga/qemu-ga.exe" ];then #check for qemu guest agent to determine if it was fully installed
+    elif [ ! -f "$mountpoint/Windows/Temp/firstlogin_log.txt" ];then #check for firstlogin_log.txt to determine if it was fully installed
       (unmount_qcow2)
-      error "It appears that Windows installation was not completed in disk.qcow2. C:/Program Files/Qemu-ga/qemu-ga.exe does not exist."
+      error "It appears that Windows installation was not completed in disk.qcow2. C:/Windows/Temp/firstlogin_log.txt does not exist."
     fi
     
     remove_microsoft_defender "$mountpoint" || exit 1
     #if debloat is disabled, all this does is mount the disk.qcow2 to make sure it seems complete
-    remove_UCPD_from_mountpoint
+    remove_UCPD_from_mountpoint "$mountpoint"
     
     unmount_qcow2 || exit 1
     
@@ -1336,7 +1337,7 @@ To get a fresh VM up and running, use a sequence like this:
     
     #workaround for users who experienced microsoft defender removal failure on firstboot (https://github.com/Botspot/bvm/issues/19)
     if [ "$(cat "$vmdir/gui-steps-complete")" == 4 ];then #this will be 4 because firstboot failed after succeeding
-      (mount_qcow2 "$vmdir/disk.qcow2" && remove_microsoft_defender "/media/$USER/bvm-mount$rdp_port" && echo 5 > "$vmdir/gui-steps-complete")
+      (mount_qcow2 "$vmdir/disk.qcow2" && remove_microsoft_defender "/media/$USER/bvm-mount$rdp_port" && remove_UCPD_from_mountpoint "$mountpoint" && echo 5 > "$vmdir/gui-steps-complete")
       unmount_qcow2
     fi
     
