@@ -50,11 +50,11 @@ generate_logo() { #display cool BVM logo in terminal
   local rpired='\e[38;2;195;28;74m'
   local black='\e[30m'
   local white='\e[97m'
-  echo -e "\e[96m █████🭏 🭖█🭀  🭋█🭡 ██◣   ◢██ ${black}  ${rpigreen}   ${black}   ${rpigreen}   ${black}           \e[38;2;241;81;27m      \e[38;2;128;204;40m      ${black}                   
-\e[96m █▊  🭨█ 🭦█🭐  🭅█🭛 ███◣ ◢███ ${black}   ${rpigreen}   ${black} ${rpigreen}   ${black}            \e[38;2;241;81;27m      \e[38;2;128;204;40m      ${black}           \e[38;2;255;0;0m   ${black} \e[38;2;255;0;0m   ${black} 
+  echo -e "\e[96m █████◣ 🭖█🭀  🭋█🭡 ██◣   ◢██ ${black}  ${rpigreen}   ${black}   ${rpigreen}   ${black}           \e[38;2;241;81;27m      \e[38;2;128;204;40m      ${black}                   
+\e[96m █▊  🭨█🭬🭦█🭐  🭅█🭛 ███◣ ◢███ ${black}   ${rpigreen}   ${black} ${rpigreen}   ${black}            \e[38;2;241;81;27m      \e[38;2;128;204;40m      ${black}           \e[38;2;255;0;0m   ${black} \e[38;2;255;0;0m   ${black} 
 \e[96m █████🭪  🭖█🭀🭋█🭡  █▉◥█🭩█◤🮋█ ${black}  ${rpired}  ${black} ${rpired}   ${black} ${rpired}  ${black}     ${white}  ${black}    \e[38;2;241;81;27m      \e[38;2;128;204;40m      ${black}  ${white}      ${black}  \e[38;2;255;0;0m         ${black}
-\e[96m █▊  🭨█  🭦█🭐🭅█🭛  █▉ ◥█◤ 🮋█ ${black} ${rpired} ${black} ${rpired}   ${black} ${rpired}   ${black} ${rpired} ${black}  ${white}      ${black}  \e[38;2;0;173;239m      \e[38;2;251;188;9m      ${black}           \e[38;2;255;0;0m       ${black} 
-\e[96m █████🭠   🭖██🭡   █▉     🮋█ ${black}  ${rpired}  ${black} ${rpired}   ${black} ${rpired}  ${black}     ${white}  ${black}    \e[38;2;0;173;239m      \e[38;2;251;188;9m      ${black}  ${white}      ${black}    \e[38;2;255;0;0m     ${black}  
+\e[96m █▊  🭨█🭬 🭦█🭐🭅█🭛  █▉ ◥█◤ 🮋█ ${black} ${rpired} ${black} ${rpired}   ${black} ${rpired}   ${black} ${rpired} ${black}  ${white}      ${black}  \e[38;2;0;173;239m      \e[38;2;251;188;9m      ${black}           \e[38;2;255;0;0m       ${black} 
+\e[96m █████◤   🭖██🭡   █▉     🮋█ ${black}  ${rpired}  ${black} ${rpired}   ${black} ${rpired}  ${black}     ${white}  ${black}    \e[38;2;0;173;239m      \e[38;2;251;188;9m      ${black}  ${white}      ${black}    \e[38;2;255;0;0m     ${black}  
 ${white}BOTSPOT  VIRTUAL  MACHINE  ${black}    ${rpired}     ${black}             \e[38;2;0;173;239m      \e[38;2;251;188;9m      ${black}             \e[38;2;255;0;0m   ${black}   \e[39m"
   else
     echo "BVM - botspot virtual machine (you get the boring logo - unicode 13 not found)"
