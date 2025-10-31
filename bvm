@@ -1488,12 +1488,12 @@ To get a fresh VM up and running, use a sequence like this:
         status "QEMU closed."
         
         time_after="$(sed 's/\..*//g' /proc/uptime)"
-        if [ $((time_before+120)) -ge $time_after ];then
+        if [ $((time_before+240)) -ge $time_after ];then
           if [ $retrying == 0 ];then
-            #if qemu ran for less than 120 seconds, the VM likely had a BSOD. Try to fix it and run qemu one more time
+            #if qemu ran for less than 240 seconds, the VM likely had a BSOD. Try to fix it and run qemu one more time
             retrying=1
             
-            warning "QEMU ran for less than 120 seconds. Windows likely experienced an error during boot. Trying to fix it..."
+            warning "QEMU ran for less than 240 seconds. Windows likely experienced an error during boot. Trying to fix it..."
             
             mountpoint="/media/$USER/bvm-mount$rdp_port"
             if ! (mount_qcow2 "$vmdir/disk.qcow2") ;then
@@ -1506,8 +1506,8 @@ To get a fresh VM up and running, use a sequence like this:
             unmount_qcow2
             #continue in loop to restart qemu
           else
-            #qemu still exited with code 0 in less than 120 seconds
-            warning "Even after attempted repairs, QEMU ran for less than 120 seconds. Windows likely experienced another BSOD during boot. Giving up."
+            #qemu still exited with code 0 in less than 240 seconds
+            warning "Even after attempted repairs, QEMU ran for less than 240 seconds. Windows likely experienced another BSOD during boot. Giving up."
             break
           fi
         else
