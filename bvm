@@ -1283,7 +1283,7 @@ To get a fresh VM up and running, use a sequence like this:
     full_qemu_flags=(-M virt,accel=kvm -cpu host -m ${vm_mem}G -smp $num_cores \
       -name BVM \
       -pidfile "$vmdir/qemu.pid" \
-      -device ramfb -display gtk,grab-on-hover=on,gl=on \
+      -device ramfb -display gtk,grab-on-hover=on,gl=off \
       -device qemu-xhci \
       -device usb-kbd \
       -device usb-tablet \
@@ -1359,7 +1359,7 @@ To get a fresh VM up and running, use a sequence like this:
         display_flags=(-vga none -device ramfb -display gtk,gl=off,grab-on-hover=on$([ "$fullscreen" == true ] && echo ',full-screen=on'))
         ;;
       boot-gtk|boot)
-        display_flags=(-vga none -device virtio-gpu-pci -display gtk,gl=on,grab-on-hover=on$([ "$fullscreen" == true ] && echo ',full-screen=on'))
+        display_flags=(-vga none -device virtio-gpu-pci -display gtk,gl=off,grab-on-hover=on$([ "$fullscreen" == true ] && echo ',full-screen=on'))
         ;;
       *)
         error "Unknown suffix after 'boot': '$mode'"
