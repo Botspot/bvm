@@ -710,19 +710,22 @@ is_atomics_cpu() { #check if this CPU supports latest Windows 11, which requires
 list_cores_to_use() { #Support big.LITTLE cpus such as RK3588. List the performance cores, or all cores if all are equal. Return 1 if performance cores detected.
   local cores="$(cat /proc/cpuinfo | grep '^CPU part\|^processor\|^$' | tr '\n' '\r' | sed 's/\r\r/\n/g ; s/\r/ /g')"
   
-  #list of A76+ core part numbers: https://github.com/bp0/armids/blob/master/arm.ids
-  local grep_match='0xd0b\|0xd0c\|0xd0d\|0xd13\|0xd20\|0xd21\|0xd4a'
+  #check for big.LITTLE cores without a hard-coded list of which ones are big or little
+  #sort the CPU part numbers; cores with a greater hexadecimal value are the big ones
+  #use alphabet substitution cipher to sort easily, then convert back to hexadecimal
+  local big_core="$(echo "$cores" | grep -o '0x.*' | tr '0123456789abcdef' 'abcdefghijklmnop' | sort | tail -1 | tr 'abcdefghijklmnop' '0123456789abcdef')"
   
-  local a76_cores="$(echo "$cores" | grep -w "$grep_match")"
+  #only list core lines that are that part number (could be the whole set, or a subset)
+  local big_cores="$(echo "$cores" | grep "$big_core$")"
   
-  #if there are some a76 cores, and list of a76 cores is not the same as list of total cores
-  if [ ! -z "$a76_cores" ] && [ "$cores" != "$a76_cores" ];then
-    #performance cores detected, return only them
-    echo "$a76_cores" | awk '{print $3}'
+  #list those cores (only the core numbers for taskset to use)
+  echo "$big_cores" | awk '{print $3}'
+  
+  if [ "$cores" != "$big_cores" ];then
+    #indicate that cores listed is a subset, and taskset is needed
     return 1
   else
-    #all cores are the same, return them all
-    echo "$cores" | awk '{print $3}'
+    #all cores were returned
     return 0
   fi
 }
