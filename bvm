@@ -1447,7 +1447,7 @@ To get a fresh VM up and running, use a sequence like this:
       "${network_flags[@]}" \
       -bios /usr/share/qemu-efi-aarch64/QEMU_EFI.fd \
       -drive file="$vmdir/disk.qcow2",if=virtio,discard=unmap,aio=threads,cache=none \
-      -device qemu-xhci,id=passthrough_xhci \
+      -device qemu-xhci,id=passthrough_xhci,p2=8,p3=8 \
       "${usb_forwarding_flags[@]}")
     
     debug "full_qemu_flags: " "${full_qemu_flags[@]}"
