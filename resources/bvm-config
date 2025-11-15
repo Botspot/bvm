@@ -59,9 +59,9 @@ rdp_port=3389
 #Even more debugging: (displays every command run by the script)
 #set -x
 
-#Uncomment to disable BVM updates. Useful if you have changed the script and do not want your changes overwritten
+#Uncomment to disable BVM updates. Useful if you have changed the bvm script and do not want your changes overwritten
 #disable_updates=true
-#Most users should not have to be modifying the bvm script. It is preferable to keep all changes in this config file.
+#Most users should not need to be modifying the bvm script. It is preferable to keep all changes in this config file.
 #If your situation needs more flexibility than what the config file offers, contact me and I can try to implement something that helps everyone.
 
 #Pass additional flags to the FreeRDP viewer
@@ -69,9 +69,12 @@ rdp_port=3389
 #See all options by running wlfreerdp -help or xfreerdp -help
 
 #Network settings: leave this alone unless you know what you are doing and need to change it.
-#For security, the VM's RDP port is only accessible on localhost, not on the LAN. To change that, replace 127.0.0.1 with 0.0.0.0
-#Do not change 3389 here with your value of rdp_port set above. This 3389 is the port on the Windows side that is redirected to $rdp_port, and will always be 3389.
-#Comment this line out to prevent the VM from connecting to the Internet. (untested)
+#Put a # in front of network_flags to disable the VM's network connection.
+#For security, the VM's RDP port is only accessible on localhost, not on the local network. To allow incoming RDP connections from the local network, replace 127.0.0.1 with 0.0.0.0
+#To forward additional ports from Windows: add additional hostfwd parameters on the same line.
+#For example, let's forward port 2222 on Windows to port 22 on linux: ,hostfwd=tcp:127.0.0.1:2222-:22
+#For that port to be visible on the local network, change it to this: ,hostfwd=tcp:0.0.0.0:22-:22
+#(add these arguments directly to the end of the "3389" with no space character)
 network_flags=(-netdev user,id=nic,hostfwd=tcp:127.0.0.1:${rdp_port}-:3389 -device virtio-net-pci,netdev=nic)
 
 #To add flags to QEMU, nothing is stopping you from hijacking network_flags with whatever QEMU flags you want.
