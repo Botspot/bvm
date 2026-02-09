@@ -1165,8 +1165,6 @@ To get a fresh VM up and running, use a sequence like this:
         #vmdir and $download_language must be set for this function
         download_windows_11arm64 || exit 1
         
-        #Patch the ISO to not require a keypress to boot
-        patch_iso_noprompt "$vmdir/installer.iso" || exit 1
       else # (Pi4)
         warning "Downloading an older Windows version that is compatible with your device. Later versions of Windows 11 require the 'atomics' ARM instruction that your CPU lacks."
         #get Windows build 22631 for Pi4s and other A53 CPUs
@@ -1237,6 +1235,10 @@ To get a fresh VM up and running, use a sequence like this:
     ;;
     
   prepare) #take downloaded files and get everything ready for first boot
+    
+    #Patch the ISO to not require a keypress to boot
+    # This was moved to the prepare step to patch the iso if user manually downloaded it (see https://github.com/Botspot/bvm/issues/167)
+    patch_iso_noprompt "$vmdir/installer.iso" || exit 1
     
     #make drive to pass to installer (virtio arm drivers with unattended stuff and debloating script)
     status -n "Making unattended.iso... "
