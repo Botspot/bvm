@@ -1238,7 +1238,11 @@ To get a fresh VM up and running, use a sequence like this:
     
     #Patch the ISO to not require a keypress to boot
     # This was moved to the prepare step to patch the iso if user manually downloaded it (see https://github.com/Botspot/bvm/issues/167)
-    patch_iso_noprompt "$vmdir/installer.iso" || exit 1
+    if is_atomics_cpu ;then
+      #if pi4 version was downloaded, the iso was made with the noprompt patch already
+      #avoid patching in that case - fixes https://github.com/Botspot/bvm/discussions/168
+      patch_iso_noprompt "$vmdir/installer.iso" || exit 1
+    fi
     
     #make drive to pass to installer (virtio arm drivers with unattended stuff and debloating script)
     status -n "Making unattended.iso... "
