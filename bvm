@@ -1595,7 +1595,7 @@ To get a fresh VM up and running, use a sequence like this:
           #Copy new-and-improved remmina config
           grep -qF 'to get microphone input working' "$vmdir/connect.remmina" 2>/dev/null || cp -f "${DIRECTORY}/resources/connect.remmina" "$vmdir/connect.remmina"
           #Use Remmina to set parameters in profile
-          echo -e "$vm_username\n$vm_password\n127.0.0.1:$rdp_port\n$quality\n$HOME" | remmina --update-profile "$vmdir/connect.remmina" --set-option username --set-option password --set-option server --set-option quality --set-option drive
+          echo -e "$vm_username\n$vm_password\n127.0.0.1:$rdp_port\n$quality\n$HOME\n$(echo "$fullscreen" | sed 's/true/3/g ; s/false/1/g')" | remmina --update-profile "$vmdir/connect.remmina" --set-option username --set-option password --set-option server --set-option quality --set-option drive --set-option viewmode
           
           #fullscreen mode - enable toolbar, otherwise hide left-align toolbar which is mostly useless
           if [ "$fullscreen" == true ];then
