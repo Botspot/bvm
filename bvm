@@ -869,12 +869,14 @@ if [ "$(id -u)" == 0 ]; then
   error "BVM cannot be run as root user. Wayland programs need to be run as a non-root user."
 elif [ "$(modinfo --filename kvm)" != "(builtin)" ] && ! sudo modprobe kvm ;then
   error "User error: KVM kernel module is needed but missing. Command that failed was 'sudo modprobe kvm'"
-
-#it seems being part of the kvm group is unnecessary
-#elif ! groups | grep -q ' kvm ' ;then
-#  sudo usermod -aG kvm $USER
-#  error "Your user was not part of kvm group. Now they are. Please reboot."
-#fi
+elif [ ! -r /dev/kvm ] || [ ! -w /dev/kvm ];then
+  #kvm should be available, but it seems to not be readable and writable
+  sudo usermod -aG kvm $USER
+  sudo chmod 666 /dev/kvm
+  #check if anything has changed
+  if [ ! -r /dev/kvm ] || [ ! -w /dev/kvm ];then
+    error "User error: Your OS prevents access to /dev/kvm. This script has tried adding your user to the kvm group, and changing the permissions to 666, yet it's still inaccessible. Please reboot."
+  fi
 #check RAM and choose how much to allocate the VM
 elif [ "$(awk '/MemTotal/ {print $2}' /proc/meminfo)" -le $((1*1024*1024)) ];then
   error "User error: Your system needs at least 2 GB of RAM. Be aware that a VM might be able to boot on 1 GB of RAM, but it cannot install Windows with less than 2 GB."
