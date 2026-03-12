@@ -554,8 +554,8 @@ package_available() { #determine if the specified package-name exists in a local
 }
 
 install_dependencies() { #try to install everything BVM needs
-  required_commands="git jq wget mkisofs qemu-img qemu-system-aarch64 remmina nmap wget yad uuidgen wiminfo socat ntfsresize nc"
-  apt_packages="git jq wget genisoimage qemu-utils qemu-system-arm qemu-system-gui qemu-efi-aarch64 remmina remmina-plugin-rdp nmap wget yad uuid-runtime seabios ipxe-qemu wimtools socat ntfs-3g netcat-traditional"
+  required_commands="git jq wget mkisofs qemu-img qemu-system-aarch64 remmina nmap wget yad uuidgen wiminfo socat ntfsresize nc bc"
+  apt_packages="git jq wget genisoimage qemu-utils qemu-system-arm qemu-system-gui qemu-efi-aarch64 remmina remmina-plugin-rdp nmap wget yad uuid-runtime seabios ipxe-qemu wimtools socat ntfs-3g netcat-traditional bc"
   
   #using freerdp version 2 instead of 3 because it does not freeze on login and has more reliable clipboard sync
   if [ "$XDG_SESSION_TYPE" == wayland ];then
