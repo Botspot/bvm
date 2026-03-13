@@ -772,6 +772,11 @@ export -f usb_passthrough_frontend #make available to clickhandler
 #full path to the bvm folder storing this script
 DIRECTORY="$(readlink -f "$(dirname "$(readlink -f "$0")")")"
 
+#Ensure /usr/sbin is in PATH to fix https://github.com/Botspot/bvm/issues/180
+if [[ ":$PATH:" != *":/usr/sbin:"* ]]; then
+  export PATH+=":/usr/sbin"
+fi
+
 #Track the original arguments given to the script in order to restart in an update
 original_flags=("$@")
 
