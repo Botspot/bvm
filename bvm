@@ -1714,7 +1714,18 @@ To get a fresh VM up and running, use a sequence like this:
             #ask for user input to prevent a forever failed connection loop
             status_green "VM never went offline."
             status -n "Assuming you disconnected. Press any key to reconnect, or Ctrl+C to unsafely force-kill the VM."
-            read -N1 key
+            key=''
+            while true;do
+              #check for keypress in 1 second of time
+              if read -N1 -t1 key ;then
+                #user pressed key, reconnect
+                break
+              elif ! process_exists "$(cat "$vmdir/qemu.pid" 2>/dev/null)" ;then
+                #1 second timeout reached and qemu pid stopped, don't try to reconnect
+                echo ' VM shut down' #add newline to the status -n from earlier
+                exit 0
+              fi
+            done
             break
           fi
         elif [ $messaged == 0 ];then
