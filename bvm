@@ -496,6 +496,79 @@ patch_iso_noprompt() { #force the specified windows iso not require keypress to 
   echo "Done"
 }
 
+patch_iso_noprompt_oldwindows() { #force the specified windows iso (with a different version of efisys.bin) to not require keypress to boot into installer - by botspot
+  #This function only runs if the primary patch_iso_noprompt fails.
+  # Windows server 2025 and maybe windows 10 ships a somehow different efisys.bin and efisys_noprompt.bin files
+  #  Same filesize and start base64, but the search string is at a different offset and the hash is different.
+  #   I simply duplicated this function to handle edge cases when users provide their own ISOs, without risking introducing a regression to 99% of bvm users.
+  
+  #replace inside the ISO efisys.bin with contents of efisys_noprompt.bin
+  #efisys.bin contains cdboot.pdb string
+  #efisys_noprompt.bin contains cdboot_noprompt.pdb string
+  #both files are the exact same length, so as long as they are in one piece in the ISO, we can replace one with the other using dd.
+  #find and extract efisys_noprompt.bin, then find instances of efisys.bin and replace with efisys_noprompt.bin
+  
+  #where in the efisys.bin file the 'cdboot.pdb' string is,
+  #and where in the efisys_noprompt.bin file the 'cdboot_noprompt.pdb' string is (how far to backtrack)
+  #found with grep -abo 'cdboot\.pdb' '/mnt/winiso/efi/microsoft/boot/efisys.bin' | awk -F: '{print $1}'
+  local match_offset=991528
+  
+  #the total length of efisys.bin or efisys_noprompt.bin files (how much data to copy)
+  #found with wc -c
+  local file_length=1720320
+  
+  local ISO="$1"
+  local match
+  
+  #first find and extract efisys_noprompt.bin in ISO, to avoid distributing it ourselves
+  status "Modifying Windows ISO to boot to installer without keypress:"
+  echo "  - Searching for efisys_noprompt.bin to extract..."
+  while read match ;do
+    local start_offset=$((match-match_offset))
+    
+    #check if this is the expected start of file, - there is one false positive in testing
+    if [ "$(dd if="$ISO" skip=$start_offset bs=1 count=16 status=none | base64)" != '6zyQTVNETUYzLjIAAgIBAA==' ];then
+      echo "  - negative match at byte $start_offset"
+      continue #back to start of loop, avoid overwriting random bits of the ISO if we did not find the expected start of the file
+    fi
+    echo "  - positive match at byte $start_offset"
+    
+    #copy the file to /tmp and exit the loop
+    echo "  - Extracting it..."
+    dd if="$ISO" bs=1 skip=$start_offset count="$file_length" of=/tmp/efisys_noprompt.bin status=none
+    break
+    
+  done < <(grep -abo 'cdboot_noprompt\.pdb' "$ISO" | awk -F: '{print $1}')
+  
+  #make sure efisys_noprompt.bin was extracted successfully
+  if [ ! -f /tmp/efisys_noprompt.bin ];then
+    error "Failed to extract efisys_noprompt.bin from ISO!"
+  elif [ "$(sha1sum /tmp/efisys_noprompt.bin | awk '{print $1}')" != '6ca7d07764a44c7015817a55eccb72fac4954599' ];then
+    error "The extracted efisys_noprompt.bin had an unexpected hash sum"
+  else
+    echo "  - Checksums match! Now searching ISO for sections to replace..."
+  fi
+  
+  #now find byte offsets for efisys.bin in the ISO, and overwrite those sections of the ISO with efisys_noprompt.bin
+  #search for cdboot.pdb in the iso, noting the offsets, and subtracting the offset of cdboot.pdb string to get start offset of file
+  while read match ;do
+    start_offset=$((match-match_offset))
+    
+    #check if this is the expected start of file - there is one false positive in testing
+    if [ "$(dd if="$ISO" skip=$start_offset bs=1 count=16 status=none | base64)" != '6zyQTVNETUYzLjIAAgIBAA==' ];then
+      echo "  - negative match at byte $start_offset, continuing to search..."
+      continue #back to start of loop, avoid overwriting random bits of the ISO if we did not find the expected start of the file
+    fi
+    
+    echo "  - positive match at byte $start_offset, replacing the next $file_length bytes..."
+    dd if=/tmp/efisys_noprompt.bin of="$ISO" bs=1 seek=$start_offset conv=notrunc status=none
+    
+  done < <(grep -abo 'cdboot\.pdb' "$ISO" | awk -F: '{print $1}')
+  
+  rm -f /tmp/efisys_noprompt.bin
+  echo "Done"
+}
+
 get_codename() { #get debian/ubuntu codename
   #taken from pi-apps
   if ! command -v lsb_release >/dev/null; then
@@ -1243,14 +1316,6 @@ To get a fresh VM up and running, use a sequence like this:
     
   prepare) #take downloaded files and get everything ready for first boot
     
-    #Patch the ISO to not require a keypress to boot
-    # This was moved to the prepare step to patch the iso if user manually downloaded it (see https://github.com/Botspot/bvm/issues/167)
-    if is_atomics_cpu ;then
-      #if pi4 version was downloaded, the iso was made with the noprompt patch already
-      #avoid patching in that case - fixes https://github.com/Botspot/bvm/discussions/168
-      patch_iso_noprompt "$vmdir/installer.iso" || exit 1
-    fi
-    
     #make drive to pass to installer (virtio arm drivers with unattended stuff and debloating script)
     status -n "Making unattended.iso... "
     #lesson learned: -J -r -allow-lowercase -allow-multidot fixes debloat script names being truncated
@@ -1269,6 +1334,19 @@ To get a fresh VM up and running, use a sequence like this:
     status -n "Allocating ${disksize}GB for main install drive... "
     errors="$(qemu-img create -f qcow2 -o cluster_size=2M,nocow=on,preallocation=metadata "$vmdir/disk.qcow2" "${disksize}G" 2>&1)" || error "\nFailed to create $vmdir/disk.qcow2\nErrors:\n$errors"
     status_green Done
+    
+    #Patch the ISO to not require a keypress to boot
+    # This was moved to the prepare step to patch the iso if user manually downloaded it (see https://github.com/Botspot/bvm/issues/167)
+    if is_atomics_cpu ;then
+      #if pi4 version was downloaded, the iso was made with the noprompt patch already
+      #avoid patching in that case - fixes https://github.com/Botspot/bvm/discussions/168
+      if ! (patch_iso_noprompt "$vmdir/installer.iso") ;then
+        warning "Failed to patch the ISO to not require a keypress with the normal method, trying backup method for Windows Server images..."
+        if ! (patch_iso_noprompt_oldwindows "$vmdir/installer.iso") ;then
+          error "Failed to patch the ISO with the backup method. If you're using your own ISO file, you can probably ignore this message and proceed. Otherwise, something is wrong. Please troubleshoot, or ask the BVM developers for help."
+        fi
+      fi
+    fi
     
     #for GUI: track which step was completed
     if [ 4 -gt "$(cat "$vmdir/gui-steps-complete")" ];then
