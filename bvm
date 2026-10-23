@@ -188,7 +188,7 @@ mount_qcow2() { #mount the $1 qcow2 disk image to /media/$USER/bvm-mount$rdp_por
   
   sudo mkdir -p /media/$USER/bvm-mount$rdp_port
   umount_retry /media/$USER/bvm-mount$rdp_port
-  if ! sudo mount -t ntfs-3g "$mount_args[@]}" ${nbd_device}p4 /media/$USER/bvm-mount$rdp_port ;then
+  if ! sudo mount -t ntfs-3g "${mount_args[@]}" ${nbd_device}p4 /media/$USER/bvm-mount$rdp_port ;then
     #mount failed, unmount and cleanup
     unmount_qcow2
     error "mount_qcow2: mount command failed"
