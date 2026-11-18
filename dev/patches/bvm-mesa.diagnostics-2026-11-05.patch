@@ -1,0 +1,1126 @@
+diff --git a/src/broadcom/compiler/qpu_schedule.c b/src/broadcom/compiler/qpu_schedule.c
+index f524746..fd5c5f5 100644
+--- a/src/broadcom/compiler/qpu_schedule.c
++++ b/src/broadcom/compiler/qpu_schedule.c
+@@ -65,6 +65,20 @@ struct schedule_node {
+         uint32_t latency;
+ };
+ 
++/* BVM FIX (README item 128): the scheduler orders all TMU config writes (wrtmuc signals and the register writes to
++ * tmuc of our dynamic sampler path) in program order. Without it a schedule can write config word P1 before P0 and
++ * the TMU reads its sampler state from a garbage address (GPU hang). BVM_V3D_TMUCORDER=0 disables it (experiments). */
++static bool
++bvm_tmuc_order(void)
++{
++        static int v = -1;
++        if (v < 0) {
++                const char *e = getenv("BVM_V3D_TMUCORDER");
++                v = !(e && *e == '0');
++        }
++        return v;
++}
++
+ /* When walking the instructions in reverse, we need to swap before/after in
+  * add_dep().
+  */
+@@ -79,6 +93,7 @@ struct schedule_state {
+         struct schedule_node *last_vpm_read;
+         struct schedule_node *last_tmu_write;
+         struct schedule_node *last_tmu_config;
++        struct schedule_node *last_tmuc_order;   /* BVM: order of TMU config writes (wrtmuc signal + tmuc register) */
+         struct schedule_node *last_tmu_read;
+         struct schedule_node *last_tlb;
+         struct schedule_node *last_vpm;
+@@ -240,6 +255,9 @@ process_waddr_deps(struct schedule_state *state, struct schedule_node *n,
+         if (!magic) {
+                 add_write_dep(state, &state->last_rf[waddr], n);
+         } else if (v3d_qpu_magic_waddr_is_tmu(state->devinfo, waddr)) {
++                if (waddr == V3D_QPU_WADDR_TMUC && bvm_tmuc_order())
++                        add_write_dep(state, &state->last_tmuc_order, n);
++
+                 if (can_reorder_tmu_write(state->devinfo, waddr))
+                         add_read_dep(state, state->last_tmu_write, n);
+                 else
+@@ -491,8 +509,13 @@ calculate_deps(struct schedule_state *state, struct schedule_node *n)
+          * same TMU sequence by using a read dependency on the last TMU
+          * sequence terminator.
+          */
+-        if (inst->sig.wrtmuc)
++        if (inst->sig.wrtmuc) {
+                 add_read_dep(state, state->last_tmu_config, n);
++                /* BVM (README item 128): keep all TMU config words (wrtmuc signals AND tmuc register
++                 * writes of our dynamic sampler path) in program order */
++                if (bvm_tmuc_order())
++                        add_write_dep(state, &state->last_tmuc_order, n);
++        }
+ 
+         if (inst->sig.ldtlb | inst->sig.ldtlbu)
+                 add_write_dep(state, &state->last_tlb, n);
+@@ -1348,6 +1371,18 @@ qpu_merge_inst(const struct v3d_device_info *devinfo,
+         merge.sig.rotate |= b->sig.rotate;
+         merge.sig.wrtmuc |= b->sig.wrtmuc;
+ 
++        /* BVM experiment (README item 120): the V3D 7.1 signal table has ldtmu+wrtmuc
++         * (and thrsw+ldtmu+wrtmuc) in one instruction; BVM_V3D_NOLDTMUWRTMUC=1 forbids it. */
++        if (merge.sig.ldtmu && merge.sig.wrtmuc) {
++                static int bvm_nomerge = -1;
++                if (bvm_nomerge < 0) {
++                        const char *e = getenv("BVM_V3D_NOLDTMUWRTMUC");
++                        bvm_nomerge = (e && *e == '1');
++                }
++                if (bvm_nomerge)
++                        return false;
++        }
++
+         if (v3d_qpu_sig_writes_address(devinfo, &a->sig) &&
+             v3d_qpu_sig_writes_address(devinfo, &b->sig))
+                 return false;
+diff --git a/src/broadcom/compiler/v3d_tex.c b/src/broadcom/compiler/v3d_tex.c
+index 5f3a001..db56ae7 100644
+--- a/src/broadcom/compiler/v3d_tex.c
++++ b/src/broadcom/compiler/v3d_tex.c
+@@ -128,6 +128,15 @@ handle_tex_src(struct v3d_compile *c,
+                 }
+                 break;
+ 
++        case nir_tex_src_sampler_offset:
++        case nir_tex_src_texture_offset:
++                /* BVMGPU: consumed when the TMU config is written (see
++                 * v3d_vir_emit_tex), no TMU register write of its own. Fetch
++                 * it here so any TMU flush happens before the writes start.
++                 */
++                (void)ntq_get_src(c, instr->src[src_idx].src, 0);
++                break;
++
+         case nir_tex_src_bias: {
+                 struct qreg src = ntq_get_src(c, instr->src[src_idx].src, 0);
+                 vir_TMU_WRITE_or_count(c, V3D_QPU_WADDR_TMUB, src, tmu_writes);
+@@ -340,7 +349,32 @@ v3d_vir_emit_tex(struct v3d_compile *c, nir_tex_instr *instr)
+                          */
+                         p1_packed |= sampler_idx << 24;
+ 
+-                        vir_WRTMUC(c, QUNIFORM_TMU_CONFIG_P1, p1_packed);
++                        int sampler_off_idx =
++                                nir_tex_instr_src_index(instr, nir_tex_src_sampler_offset);
++                        if (sampler_off_idx >= 0) {
++                                /* BVMGPU: dynamically indexed sampler. The driver
++                                 * resolves the uniform to the sampler state
++                                 * address of array element 0 (plus the flag
++                                 * bits); the NIR source is the byte offset to
++                                 * the wanted element. Write the sum with a
++                                 * register write to TMUC instead of the wrtmuc
++                                 * signal. The offset is a multiple of the
++                                 * descriptor size so the flag bits are intact.
++                                 */
++                                struct qreg off =
++                                        ntq_get_src(c, instr->src[sampler_off_idx].src, 0);
++                                struct qreg base =
++                                        vir_uniform(c, QUNIFORM_TMU_CONFIG_P1, p1_packed);
++                                /* BVM experiment (README item 124): BVM_V3D_P1MOV=1 first moves the uniform
++                                 * into a temp, so it is loaded with ldunifrf into an explicit register
++                                 * instead of the implicit rf0 */
++                                const char *p1mov = getenv("BVM_V3D_P1MOV");
++                                if (p1mov && *p1mov == '1')
++                                        base = vir_MOV(c, base);
++                                vir_TMU_WRITE(c, V3D_QPU_WADDR_TMUC, vir_ADD(c, base, off));
++                        } else {
++                                vir_WRTMUC(c, QUNIFORM_TMU_CONFIG_P1, p1_packed);
++                        }
+                 } else {
+                         /* In this case, we don't need to merge in any
+                          * sampler state from the API and can just use
+diff --git a/src/broadcom/compiler/vir.c b/src/broadcom/compiler/vir.c
+index 9c538e5..0e7b134 100644
+--- a/src/broadcom/compiler/vir.c
++++ b/src/broadcom/compiler/vir.c
+@@ -568,6 +568,17 @@ vir_compile_init(const struct v3d_compiler *compiler,
+         c->disable_loop_unrolling = V3D_DBG(NO_LOOP_UNROLL)
+                 ? true : strategy->disable_loop_unrolling;
+ 
++        /* BVM experiments (README item 120): BVM_V3D_NOTMUPIPE=1 disables TMU pipelining in
++         * every strategy; BVM_V3D_MAXTHREADS=n caps the thread count the compiler starts with. */
++        {
++                const char *e = getenv("BVM_V3D_NOTMUPIPE");
++                if (e && *e == '1')
++                        c->disable_tmu_pipelining = true;
++                e = getenv("BVM_V3D_MAXTHREADS");
++                if (e && *e && atoi(e) > 0 && (uint32_t)atoi(e) < c->threads)
++                        c->threads = atoi(e);
++        }
++
+ 
+         s = nir_shader_clone(c, s);
+         c->s = s;
+@@ -2003,6 +2014,48 @@ set_best_compile(struct v3d_compile **best, struct v3d_compile *c)
+    *best = c;
+ }
+ 
++/* BVM workaround (README item 120): true if a texture sample sits inside a loop. */
++static bool
++bvm_cf_list_has_tex_in_loop(struct exec_list *list, bool in_loop)
++{
++        foreach_list_typed(nir_cf_node, node, node, list) {
++                switch (node->type) {
++                case nir_cf_node_block:
++                        if (in_loop) {
++                                nir_foreach_instr(instr, nir_cf_node_as_block(node)) {
++                                        if (instr->type == nir_instr_type_tex)
++                                                return true;
++                                }
++                        }
++                        break;
++                case nir_cf_node_if: {
++                        nir_if *nif = nir_cf_node_as_if(node);
++                        if (bvm_cf_list_has_tex_in_loop(&nif->then_list, in_loop) ||
++                            bvm_cf_list_has_tex_in_loop(&nif->else_list, in_loop))
++                                return true;
++                        break;
++                }
++                case nir_cf_node_loop:
++                        if (bvm_cf_list_has_tex_in_loop(&nir_cf_node_as_loop(node)->body, true))
++                                return true;
++                        break;
++                default:
++                        break;
++                }
++        }
++        return false;
++}
++
++static bool
++bvm_shader_has_tex_in_loop(nir_shader *s)
++{
++        nir_foreach_function_impl(impl, s) {
++                if (bvm_cf_list_has_tex_in_loop(&impl->body, false))
++                        return true;
++        }
++        return false;
++}
++
+ uint64_t *v3d_compile(const struct v3d_compiler *compiler,
+                       struct v3d_key *key,
+                       struct v3d_prog_data **out_prog_data,
+@@ -2019,9 +2072,25 @@ uint64_t *v3d_compile(const struct v3d_compiler *compiler,
+ 
+         MESA_TRACE_FUNC();
+ 
+-        for (int32_t strat = 0; strat < ARRAY_SIZE(strategies); strat++) {
++        /* BVM workaround (superseded by the TMU config ordering fix in qpu_schedule.c, README item 128, and OFF by
++         * default now): BVM_V3D_LOOPTEX_2T=1 compiles V3D 7.x fragment shaders with a texture sample inside a loop
++         * for 2 threads (the hang of README item 120 went away that way). */
++        int32_t first_strat = 0;
++        if (compiler->devinfo->ver >= 71 && s->info.stage == MESA_SHADER_FRAGMENT) {
++                const char *e = getenv("BVM_V3D_LOOPTEX_2T");
++                if ((e && *e == '1') && bvm_shader_has_tex_in_loop(s))
++                        first_strat = 6;
++        }
++        /* BVM experiment: BVM_V3D_STRAT=n starts every compile at strategy n (0..12, see the table above) */
++        {
++                const char *e = getenv("BVM_V3D_STRAT");
++                if (e && *e && atoi(e) >= 0 && (size_t)atoi(e) < ARRAY_SIZE(strategies))
++                        first_strat = atoi(e);
++        }
++
++        for (int32_t strat = first_strat; strat < ARRAY_SIZE(strategies); strat++) {
+                 /* Fallback strategy */
+-                if (strat > 0) {
++                if (strat > first_strat) {
+                         assert(c);
+                         if (skip_compile_strategy(c, strat))
+                                 continue;
+diff --git a/src/broadcom/compiler/vir_register_allocate.c b/src/broadcom/compiler/vir_register_allocate.c
+index dfb5b9a..2a69e7b 100644
+--- a/src/broadcom/compiler/vir_register_allocate.c
++++ b/src/broadcom/compiler/vir_register_allocate.c
+@@ -1064,8 +1064,16 @@ vir_init_reg_sets(struct v3d_compiler *compiler)
+                         ra_alloc_contig_reg_class(compiler->regs, 1);
+ 
+                 /* Init physical regs */
++                int bvm_phys = PHYS_COUNT >> threads;
++                {
++                        /* BVM experiment (README item 120): BVM_V3D_PHYS4=n caps the
++                         * registers 4-thread code may use (class index 1). */
++                        const char *e = getenv("BVM_V3D_PHYS4");
++                        if (threads == 1 && e && *e && atoi(e) > 0 && atoi(e) < bvm_phys)
++                                bvm_phys = atoi(e);
++                }
+                 for (int i = phys_index;
+-                     i < phys_index + (PHYS_COUNT >> threads); i++) {
++                     i < phys_index + bvm_phys; i++) {
+                         if (compiler->devinfo->has_accumulators)
+                                 ra_class_add_reg(compiler->reg_class_phys_or_acc[threads], i);
+                         ra_class_add_reg(compiler->reg_class_phys[threads], i);
+@@ -1326,7 +1334,17 @@ update_graph_and_reg_classes_for_inst(struct v3d_compile *c,
+                          * have implicit writes to rf0 and that would hurt
+                          * pairing.
+                          */
+-                        if ((inst->qpu.sig.ldunif || inst->qpu.sig.ldunifa) &&
++                        /* BVM experiment (README item 126): BVM_V3D_NORF0UNIF=1 never steers ldunif/ldunifa destinations
++                         * into the implicit rf0 (they become ldunifrf/ldunifarf). It fixes the two DWM blur shaders in
++                         * the plain Vulkan repros but makes the full DWM capture replay hang MORE (another shader
++                         * hangs), so it is OFF by default. */
++                        static int bvm_norf0 = -1;
++                        if (bvm_norf0 < 0) {
++                                const char *e = getenv("BVM_V3D_NORF0UNIF");
++                                bvm_norf0 = (e && *e == '1');
++                        }
++                        if (!bvm_norf0 &&
++                            (inst->qpu.sig.ldunif || inst->qpu.sig.ldunifa) &&
+                             (c->s->info.stage != MESA_SHADER_FRAGMENT ||
+                              ip > last_ldvary_ip + 4)) {
+                                 const uint32_t dst_n =
+diff --git a/src/broadcom/compiler/vir_to_qpu.c b/src/broadcom/compiler/vir_to_qpu.c
+index 605c3e4..3d54473 100644
+--- a/src/broadcom/compiler/vir_to_qpu.c
++++ b/src/broadcom/compiler/vir_to_qpu.c
+@@ -495,6 +495,46 @@ v3d_vir_to_qpu(struct v3d_compile *c, struct qpu_reg *temp_registers)
+         }
+         assert(i == c->qpu_inst_count);
+ 
++        /* BVM experiment (README item 124): BVM_V3D_MUT="kind:idx,kind:idx" with BVM_V3D_MUTN=<instruction count of the
++         * fragment shader to touch> rewrites instructions of the finished code.  kinds: nothrsw (clear the thrsw
++         * signal), noalu (remove both ALU operations, keep the signals), nosigs (remove all signals, keep the ALU). */
++        {
++                const char *m = getenv("BVM_V3D_MUT"), *mn = getenv("BVM_V3D_MUTN");
++                if (m && *m && mn && c->s->info.stage == MESA_SHADER_FRAGMENT &&
++                    (int)c->qpu_inst_count == atoi(mn)) {
++                        char *dup = strdup(m), *save = NULL;
++                        for (char *tok = strtok_r(dup, ",", &save); tok; tok = strtok_r(NULL, ",", &save)) {
++                                char kind[16];
++                                int idx;
++                                if (sscanf(tok, "%15[a-z]:%d", kind, &idx) != 2 || idx < 0 ||
++                                    idx >= (int)c->qpu_inst_count)
++                                        continue;
++                                struct v3d_qpu_instr q;
++                                if (!v3d_qpu_instr_unpack(c->devinfo, c->qpu_insts[idx], &q))
++                                        continue;
++                                if (!strcmp(kind, "nothrsw")) {
++                                        q.sig.thrsw = false;
++                                } else if (!strcmp(kind, "noalu") && q.type == V3D_QPU_INSTR_TYPE_ALU) {
++                                        q.alu.add.op = V3D_QPU_A_NOP;
++                                        q.alu.add.magic_write = true;
++                                        q.alu.add.waddr = V3D_QPU_WADDR_NOP;
++                                        q.alu.mul.op = V3D_QPU_M_NOP;
++                                        q.alu.mul.magic_write = true;
++                                        q.alu.mul.waddr = V3D_QPU_WADDR_NOP;
++                                        memset(&q.flags, 0, sizeof(q.flags));
++                                } else if (!strcmp(kind, "nosigs")) {
++                                        memset(&q.sig, 0, sizeof(q.sig));
++                                }
++                                uint64_t packed;
++                                if (v3d_qpu_instr_pack(c->devinfo, &q, &packed))
++                                        c->qpu_insts[idx] = packed;
++                                else
++                                        fprintf(stderr, "BVMQPU: cannot pack %s:%d\n", kind, idx);
++                        }
++                        free(dup);
++                }
++        }
++
+         if (V3D_DBG(QPU) ||
+             v3d_debug_flag_for_shader_stage(c->s->info.stage)) {
+                 v3d_dump_qpu(c);
+diff --git a/src/broadcom/vulkan/v3dv_cmd_buffer.c b/src/broadcom/vulkan/v3dv_cmd_buffer.c
+index 8672f71..838544e 100644
+--- a/src/broadcom/vulkan/v3dv_cmd_buffer.c
++++ b/src/broadcom/vulkan/v3dv_cmd_buffer.c
+@@ -793,6 +793,8 @@ v3dv_job_init(struct v3dv_job *job,
+    assert(!cmd_buffer || cmd_buffer->state.job != job);
+ 
+    job->type = type;
++   job->bvm_desc[0] = 0;
++   job->bvm_loadstore_only = false;
+ 
+    job->device = device;
+    job->cmd_buffer = cmd_buffer;
+@@ -1803,6 +1805,93 @@ v3dv_cmd_buffer_subpass_start(struct v3dv_cmd_buffer *cmd_buffer,
+    if (!job)
+       return NULL;
+ 
++   /* BVMDIAG: describe the attachments (format/load/store/samples) so
++    * BVM_V3DV_JOBLOG can show what each render-pass job is.
++    */
++   {
++      const struct v3dv_render_pass *p = cmd_buffer->state.pass;
++      const struct v3dv_subpass *sp = &p->subpasses[subpass_idx];
++      char *d = job->bvm_desc;
++      size_t n = sizeof(job->bvm_desc), o = 0;
++      bool loadstore_only = true, any_att = false;
++      for (uint32_t i = 0; i < sp->color_count && o < n; i++) {
++         uint32_t a = sp->color_attachments[i].attachment;
++         if (a == VK_ATTACHMENT_UNUSED)
++            continue;
++         const VkAttachmentDescription2 *ad = &p->attachments[a].desc;
++         any_att = true;
++         if (ad->loadOp != VK_ATTACHMENT_LOAD_OP_LOAD ||
++             ad->storeOp != VK_ATTACHMENT_STORE_OP_STORE ||
++             (sp->resolve_attachments &&
++              sp->resolve_attachments[i].attachment != VK_ATTACHMENT_UNUSED))
++            loadstore_only = false;
++         int tl = -1;
++         if (cmd_buffer->state.attachments &&
++             cmd_buffer->state.attachments[a].image_view) {
++            const struct v3dv_image_view *iv =
++               cmd_buffer->state.attachments[a].image_view;
++            const struct v3dv_image *im = (const struct v3dv_image *)iv->vk.image;
++            tl = im->planes[iv->planes[0].image_plane]
++                   .slices[iv->vk.base_mip_level].tiling;
++         }
++         o += snprintf(d + o, n - o, "C%u:f%d,L%d,S%d,x%d,t%d%s ", i, ad->format,
++                       ad->loadOp, ad->storeOp, ad->samples, tl,
++                       sp->resolve_attachments &&
++                       sp->resolve_attachments[i].attachment !=
++                          VK_ATTACHMENT_UNUSED ? ",R" : "");
++         /* image/BO geometry of the first color attachment (hang hunt) */
++         if (i == 0 && cmd_buffer->state.attachments &&
++             cmd_buffer->state.attachments[a].image_view && o < n) {
++            const struct v3dv_image_view *iv =
++               cmd_buffer->state.attachments[a].image_view;
++            const struct v3dv_image *im =
++               (const struct v3dv_image *)iv->vk.image;
++            const uint8_t pl = iv->planes[0].image_plane;
++            const struct v3d_resource_slice *sl =
++               &im->planes[pl].slices[iv->vk.base_mip_level];
++            const struct v3dv_bo *bo =
++               im->planes[pl].mem ? im->planes[pl].mem->bo : NULL;
++            o += snprintf(d + o, n - o,
++                          "IMG[%ux%u mip=%u lay=%u/%u off=%u str=%u ph=%u "
++                          "ubpad=%u pubh=%u ssz=%u psz=%llu moff=%llu "
++                          "bo=%u imp=%d] ",
++                          im->vk.extent.width, im->vk.extent.height,
++                          iv->vk.base_mip_level, iv->vk.base_array_layer,
++                          iv->vk.layer_count, sl->offset, sl->stride,
++                          sl->padded_height, sl->ub_pad,
++                          sl->padded_height_of_output_image_in_uif_blocks,
++                          sl->size,
++                          (unsigned long long)im->planes[pl].size,
++                          (unsigned long long)im->planes[pl].mem_offset,
++                          bo ? bo->size : 0, bo ? bo->is_import : -1);
++         }
++      }
++      if (sp->ds_attachment.attachment != VK_ATTACHMENT_UNUSED && o < n) {
++         const VkAttachmentDescription2 *ad =
++            &p->attachments[sp->ds_attachment.attachment].desc;
++         int tl = -1;
++         const uint32_t da = sp->ds_attachment.attachment;
++         if (cmd_buffer->state.attachments &&
++             cmd_buffer->state.attachments[da].image_view) {
++            const struct v3dv_image_view *iv =
++               cmd_buffer->state.attachments[da].image_view;
++            const struct v3dv_image *im = (const struct v3dv_image *)iv->vk.image;
++            tl = im->planes[iv->planes[0].image_plane]
++                   .slices[iv->vk.base_mip_level].tiling;
++         }
++         snprintf(d + o, n - o, "DS:f%d,L%d,S%d,sL%d,sS%d,t%d", ad->format,
++                  ad->loadOp, ad->storeOp, ad->stencilLoadOp,
++                  ad->stencilStoreOp, tl);
++         any_att = true;
++         if (ad->loadOp != VK_ATTACHMENT_LOAD_OP_LOAD ||
++             ad->storeOp != VK_ATTACHMENT_STORE_OP_STORE ||
++             ad->stencilLoadOp != VK_ATTACHMENT_LOAD_OP_LOAD ||
++             ad->stencilStoreOp != VK_ATTACHMENT_STORE_OP_STORE)
++            loadstore_only = false;
++      }
++      job->bvm_loadstore_only = loadstore_only && any_att;
++   }
++
+    /* FIXME: do we need all this below for resuming jobs?  */
+ 
+    /* Check if our render area is aligned to tile boundaries. We have to do
+@@ -3081,6 +3170,19 @@ static void
+ cmd_buffer_draw(struct v3dv_cmd_buffer *cmd_buffer,
+                 struct v3dv_draw_info *info)
+ {
++   /* BVM: replaying a capture on a GPU that cannot build one of the pipelines (the llvmpipe capability
++    * probe in Neptune captures) leaves draws with no pipeline bound; skip them instead of crashing
++    * (BVM_V3DV_SKIPNOPIPE=1, README item 124). */
++   if (!cmd_buffer->state.gfx.pipeline) {
++      static int skip_nopipe = -1;
++      if (skip_nopipe < 0) {
++         const char *e = getenv("BVM_V3DV_SKIPNOPIPE");
++         skip_nopipe = (e && *e == '1');
++      }
++      if (skip_nopipe)
++         return;
++   }
++
+    uint32_t vertex_count =
+       info->vertex_count * info->instance_count;
+ 
+diff --git a/src/broadcom/vulkan/v3dv_pass.c b/src/broadcom/vulkan/v3dv_pass.c
+index 6e2fd98..90f61a6 100644
+--- a/src/broadcom/vulkan/v3dv_pass.c
++++ b/src/broadcom/vulkan/v3dv_pass.c
+@@ -461,6 +461,32 @@ v3dv_subpass_area_is_tile_aligned(struct v3dv_device *device,
+    VkExtent2D granularity;
+    subpass_get_granularity(device, pass, subpass_idx, &granularity);
+ 
++   /* BVM: the RCL processes whole supertiles (see v3dv_job_start_frame, which
++    * groups tiles into supertiles to stay under 256), so every tile of a
++    * supertile that the render area touches is loaded/stored even when the
++    * area does not cover it.  Without a load those tiles are stored with
++    * undefined contents and corrupt valid pixels of the image outside the
++    * render area (e.g. a 1920x28 blit at y=960 clobbers rows 896..959 when
++    * the supertile is 1x2 tiles).  Use the supertile size as granularity.
++    */
++   {
++      const uint32_t tiles_x = DIV_ROUND_UP(fb->width, granularity.width);
++      const uint32_t tiles_y = DIV_ROUND_UP(fb->height, granularity.height);
++      uint32_t st_w = 1, st_h = 1;
++      for (;;) {
++         const uint32_t num_supertiles = DIV_ROUND_UP(tiles_x, st_w) *
++                                         DIV_ROUND_UP(tiles_y, st_h);
++         if (num_supertiles < 256)
++            break;
++         if (st_w < st_h)
++            st_w++;
++         else
++            st_h++;
++      }
++      granularity.width *= st_w;
++      granularity.height *= st_h;
++   }
++
+    return area->offset.x % granularity.width == 0 &&
+           area->offset.y % granularity.height == 0 &&
+          (area->extent.width % granularity.width == 0 ||
+diff --git a/src/broadcom/vulkan/v3dv_pipeline.c b/src/broadcom/vulkan/v3dv_pipeline.c
+index 0761bc2..5162559 100644
+--- a/src/broadcom/vulkan/v3dv_pipeline.c
++++ b/src/broadcom/vulkan/v3dv_pipeline.c
+@@ -640,6 +640,19 @@ lower_tex_src(nir_builder *b,
+    struct v3dv_descriptor_set_binding_layout *binding_layout =
+       &set_layout->binding[binding];
+ 
++   /* BVMGPU: a dynamically indexed sampler (DXVK's sampler heap) is selected by
++    * the compiler adding a BYTE offset to the sampler state address of element 0
++    * (see v3d_vir_emit_tex), so turn the element index into the byte distance
++    * between two descriptors of this binding.
++    */
++   if (is_sampler && index) {
++      uint32_t stride =
++         v3d_X((&state->pipeline->device->devinfo), descriptor_bo_size)(binding_layout->type) *
++         binding_layout->plane_stride;
++      nir_def *elem = nir_umin(b, index, nir_imm_int(b, binding_layout->array_size - 1));
++      nir_src_rewrite(&src->src, nir_imul_imm(b, elem, stride));
++   }
++
+    uint8_t return_size;
+    if (V3D_DBG(TMU_16BIT))
+       return_size = 16;
+@@ -889,9 +902,101 @@ v3d_nir_lower_point_coord(nir_shader *s)
+                                        nir_metadata_control_flow, NULL);
+ }
+ 
++/* V3D has no dual source blending.  A D3D11 (DXVK) shader using it writes
++ * a second colour output (FRAG_RESULT_DATA0, index 1), which the backend would
++ * treat as a second variable for the same output and mix up with the first.
++ * Fold it into the alpha of output 0 (alpha = average of out1.rgb) and drop the
++ * second output.  Together with mapping the SRC1_* blend factors to
++ * SRC_ALPHA (v3dvx_pipeline.c) this reproduces grayscale ClearType. */
++static void
++v3d_nir_fold_dual_source_blend(nir_shader *s)
++{
++   nir_variable *v0 = NULL, *v1 = NULL;
++   nir_foreach_shader_out_variable(var, s) {
++      if (var->data.location != FRAG_RESULT_DATA0)
++         continue;
++      if (var->data.index == 1)
++         v1 = var;
++      else
++         v0 = var;
++   }
++
++   if (!v1)
++      return;
++
++   nir_function_impl *impl = nir_shader_get_entrypoint(s);
++   NIR_PASS(_, s, nir_lower_var_copies);
++
++   nir_intrinsic_instr *st0 = NULL, *st1 = NULL;
++   unsigned n0 = 0, n1 = 0;
++   nir_foreach_block(block, impl) {
++      nir_foreach_instr(instr, block) {
++         if (instr->type != nir_instr_type_intrinsic)
++            continue;
++         nir_intrinsic_instr *i = nir_instr_as_intrinsic(instr);
++         if (i->intrinsic != nir_intrinsic_store_deref)
++            continue;
++         nir_deref_instr *d = nir_src_as_deref(i->src[0]);
++         if (d->deref_type != nir_deref_type_var)
++            continue;
++         if (d->var == v0) { st0 = i; n0++; }
++         else if (d->var == v1) { st1 = i; n1++; }
++      }
++   }
++
++   fprintf(stderr, "v3dv: dual-source fragment shader (stores out0=%u out1=%u)\n", n0, n1);
++
++   if (v0 && glsl_get_vector_elements(v0->type) == 4 && n0 == 1 && n1 == 1 &&
++       st0->src[1].ssa->bit_size == 32 && st1->src[1].ssa->bit_size == 32 &&
++       st0->instr.block == st1->instr.block) {
++      /* Make sure the output 0 store comes last so both values are available */
++      nir_index_instrs(impl);
++      if (st0->instr.index < st1->instr.index)
++         nir_instr_move(nir_after_instr(&st1->instr), &st0->instr);
++
++      nir_builder b = nir_builder_at(nir_before_instr(&st0->instr));
++      nir_def *val0 = st0->src[1].ssa;
++      nir_def *val1 = st1->src[1].ssa;
++
++      nir_def *c[4];
++      for (unsigned i = 0; i < 3; i++)
++         c[i] = i < val0->num_components ? nir_channel(&b, val0, i) : nir_imm_float(&b, 0.0f);
++
++      unsigned cnt = MIN2(val1->num_components, 3u);
++      nir_def *sum = nir_channel(&b, val1, 0);
++      for (unsigned i = 1; i < cnt; i++)
++         sum = nir_fadd(&b, sum, nir_channel(&b, val1, i));
++      c[3] = nir_fmul_imm(&b, sum, 1.0f / cnt);
++
++      nir_src_rewrite(&st0->src[1], nir_vec(&b, c, 4));
++      nir_intrinsic_set_write_mask(st0, 0xf);
++      st0->num_components = 4;
++      nir_instr_remove(&st1->instr);
++   } else {
++      /* Cannot fold: at least drop output 1 so it does not shadow output 0 */
++      nir_foreach_block(block, impl) {
++         nir_foreach_instr_safe(instr, block) {
++            if (instr->type != nir_instr_type_intrinsic)
++               continue;
++            nir_intrinsic_instr *i = nir_instr_as_intrinsic(instr);
++            if (i->intrinsic != nir_intrinsic_store_deref)
++               continue;
++            nir_deref_instr *d = nir_src_as_deref(i->src[0]);
++            if (d->deref_type == nir_deref_type_var && d->var == v1)
++               nir_instr_remove(instr);
++         }
++      }
++   }
++
++   exec_node_remove(&v1->node);
++   nir_metadata_preserve(impl, nir_metadata_control_flow);
++}
++
+ static void
+ lower_fs_io(nir_shader *nir)
+ {
++   v3d_nir_fold_dual_source_blend(nir);
++
+    /* Our backend doesn't handle array fragment shader outputs */
+    NIR_PASS_V(nir, nir_lower_io_arrays_to_elements_no_indirects, false);
+    NIR_PASS(_, nir, nir_remove_dead_variables, nir_var_shader_out, NULL);
+@@ -2370,6 +2475,22 @@ pipeline_compile_graphics(struct v3dv_pipeline *pipeline,
+       p_stage->program_id =
+          p_atomic_inc_return(&physical_device->next_program_id);
+ 
++      /* BVM debug (README item 124): BVM_V3DV_PIPELOG=1 prints the SPIR-V size of every stage next to
++       * its program id, to map a V3D_DEBUG=shaderdb/qpu listing to a pipeline of a capture. */
++      {
++         static int pipelog = -1;
++         if (pipelog < 0) {
++            const char *e = getenv("BVM_V3DV_PIPELOG");
++            pipelog = (e && *e == '1');
++         }
++         if (pipelog) {
++            const VkShaderModuleCreateInfo *smci =
++               vk_find_struct_const(sinfo->pNext, SHADER_MODULE_CREATE_INFO);
++            fprintf(stderr, "BVMPIPE prog=%u stage=%d spirv_bytes=%zu\n", p_stage->program_id,
++                    (int)stage, smci ? smci->codeSize : (size_t)0);
++         }
++      }
++
+       enum broadcom_shader_stage broadcom_stage =
+          gl_shader_stage_to_broadcom(stage);
+ 
+@@ -2521,6 +2642,15 @@ pipeline_compile_graphics(struct v3dv_pipeline *pipeline,
+    if (!p_stage_fs->nir)
+       p_stage_fs->nir = pipeline_stage_get_nir(p_stage_fs, pipeline, cache);
+ 
++   /* SPIR-V to NIR can fail (e.g. a capability V3D lacks).  Fail the
++    * pipeline instead of crashing in link_shaders(). */
++   if (!p_stage_vs->nir || !p_stage_fs->nir || (p_stage_gs && !p_stage_gs->nir)) {
++      fprintf(stderr, "v3dv: SPIR-V to NIR failed (vs=%d gs=%d fs=%d)\n",
++              p_stage_vs->nir != NULL, p_stage_gs ? p_stage_gs->nir != NULL : -1,
++              p_stage_fs->nir != NULL);
++      return VK_ERROR_UNKNOWN;
++   }
++
+    /* Linking + pipeline lowerings */
+    if (p_stage_gs) {
+       link_shaders(p_stage_gs->nir, p_stage_fs->nir);
+diff --git a/src/broadcom/vulkan/v3dv_private.h b/src/broadcom/vulkan/v3dv_private.h
+index 1ab0973..5a068a0 100644
+--- a/src/broadcom/vulkan/v3dv_private.h
++++ b/src/broadcom/vulkan/v3dv_private.h
+@@ -1266,6 +1266,14 @@ struct v3dv_job {
+    /* Number of draw calls recorded into the job */
+    uint32_t draw_count;
+ 
++   /* BVMDIAG: short description of the render pass this job came from */
++   char bvm_desc[400];
++
++   /* BVMGPU: every attachment of the render pass this job came from is
++    * LOAD + STORE with no resolve (the job does nothing unless it has draws).
++    */
++   bool bvm_loadstore_only;
++
+    /* A flag indicating whether we want to flush every draw separately. This
+     * can be used for debugging, or for cases where special circumstances
+     * require this behavior.
+diff --git a/src/broadcom/vulkan/v3dv_queue.c b/src/broadcom/vulkan/v3dv_queue.c
+index 796c204..2e72486 100644
+--- a/src/broadcom/vulkan/v3dv_queue.c
++++ b/src/broadcom/vulkan/v3dv_queue.c
+@@ -918,6 +918,21 @@ handle_csd_indirect_cpu_job(struct v3dv_queue *queue,
+    return VK_SUCCESS;
+ }
+ 
++/* BVM debug: CPU mapping of a GPU address inside one of the job's BOs (README item 118) */
++static const uint8_t *
++bvm_job_map(struct v3dv_job *job, uint32_t addr, uint32_t *room, uint32_t *bo_off)
++{
++   set_foreach(job->bos, entry) {
++      const struct v3dv_bo *bo = (const struct v3dv_bo *)entry->key;
++      if (bo->map && addr >= bo->offset && addr < bo->offset + bo->size) {
++         *room = bo->size - (addr - bo->offset);
++         *bo_off = bo->offset;
++         return (const uint8_t *)bo->map + (addr - bo->offset);
++      }
++   }
++   return NULL;
++}
++
+ static VkResult
+ handle_cl_job(struct v3dv_queue *queue,
+               struct v3dv_job *job,
+@@ -948,12 +963,69 @@ handle_cl_job(struct v3dv_queue *queue,
+    submit.rcl_start = job->rcl.bo->offset;
+    submit.rcl_end = job->rcl.bo->offset + v3dv_cl_offset(&job->rcl);
+ 
++   /* BVMGPU experiments for the V3D hang bursts (README item 104), all off by default:
++    *  BVM_V3DV_SKIPEMPTY=1  do not submit render-pass jobs that only LOAD and STORE their attachments
++    *                        and have no draws (no effect on the image); only when the job has no
++    *                        semaphore waits/signals of its own so ordering is unchanged.
++    *  BVM_V3DV_SYNCALL=1    make every CL job's binning wait for the previous job (full serialization).
++    *  BVM_V3DV_FLUSHCACHE=1 request an L2T/TMU cache flush on every CL job.
++    */
++   static int bvm_skip = -1, bvm_syncall = -1, bvm_flush = -1;
++   if (bvm_skip < 0) {
++      const char *e = getenv("BVM_V3DV_SKIPEMPTY");
++      bvm_skip = (e && *e && *e != '0') ? 1 : 0;
++      e = getenv("BVM_V3DV_SYNCALL");
++      bvm_syncall = (e && *e && *e != '0') ? 1 : 0;
++      e = getenv("BVM_V3DV_FLUSHCACHE");
++      bvm_flush = (e && *e && *e != '0') ? 1 : 0;
++   }
++   /* BVM_V3DV_SKIPTINY=1: like SKIPEMPTY, but only for frames of 2..2048 pixels
++    * (the hanging 120x8 pair, README item 105) so the early boot path stays untouched. */
++   static int bvm_skiptiny = -1;
++   static uint32_t bvm_carry_ser;
++   static bool bvm_carry_bcl, bvm_carry_tmu;
++   if (bvm_skiptiny < 0) {
++      const char *e = getenv("BVM_V3DV_SKIPTINY");
++      bvm_skiptiny = (e && *e && *e != '0') ? 1 : 0;
++   }
++   const uint32_t bvm_px = job->frame_tiling.width * job->frame_tiling.height;
++   (void)bvm_px;
++   if ((bvm_skip || (bvm_skiptiny && job->frame_tiling.height == 8 &&
++                     job->frame_tiling.width >= 64 &&
++                     job->frame_tiling.width <= 256)) &&
++       job->bvm_loadstore_only && job->draw_count == 0 &&
++       !job->is_transfer && !job->suspending && !job->resuming &&
++       !job->perf && sync_info->wait_count == 0 && !signal_syncs &&
++       submit.bcl_end - submit.bcl_start <= 32) {
++      static unsigned bvm_skipped;
++      if ((++bvm_skipped & 0x3ff) == 1)
++         fprintf(stderr, "BVMSKIP %u empty load/store passes skipped so far (%ux%u)\n",
++                 bvm_skipped, job->frame_tiling.width, job->frame_tiling.height);
++      /* A skipped job may be the one that consumed a pipeline barrier
++       * (serialize / bcl sync: wait for earlier TFU/CSD/CL work).  Hand
++       * those waits to the next job we do submit, otherwise it can run
++       * before the work the barrier was meant to order it after (wrong
++       * search-icon rendering seen with the first SKIPTINY version). */
++      bvm_carry_ser |= job->serialize;
++      bvm_carry_bcl |= job->needs_bcl_sync;
++      bvm_carry_tmu |= job->tmu_dirty_rcl;
++      return VK_SUCCESS;
++   }
++   if (bvm_carry_ser || bvm_carry_bcl || bvm_carry_tmu) {
++      job->serialize |= bvm_carry_ser;
++      job->needs_bcl_sync |= bvm_carry_bcl;
++      job->tmu_dirty_rcl |= bvm_carry_tmu;
++      bvm_carry_ser = 0;
++      bvm_carry_bcl = false;
++      bvm_carry_tmu = false;
++   }
++
+    submit.qma = job->tile_alloc->offset;
+    submit.qms = job->tile_alloc->size;
+    submit.qts = job->tile_state->offset;
+ 
+    submit.flags = 0;
+-   if (job->tmu_dirty_rcl)
++   if (job->tmu_dirty_rcl || bvm_flush)
+       submit.flags |= DRM_V3D_SUBMIT_CL_FLUSH_CACHE;
+ 
+    /* If the job uses VK_KHR_buffer_device_address we need to ensure all
+@@ -1013,6 +1085,9 @@ handle_cl_job(struct v3dv_queue *queue,
+       }
+    }
+ 
++   if (bvm_syncall)
++      needs_bcl_sync = true;
++
+    bool needs_rcl_sync = job->serialize && !needs_bcl_sync;
+ 
+    /* Replace single semaphore settings whenever our kernel-driver supports
+@@ -1036,9 +1111,324 @@ handle_cl_job(struct v3dv_queue *queue,
+    submit.out_sync = 0;
+ 
+    v3dv_clif_dump(device, job, &submit);
++
++   /* BVMDIAG: BVM_V3DV_JOBLOG=1 logs every CL job (monotonic us, RCL address
++    * as printed by the kernel v3d_submit_cl tracepoint, framebuffer, draws).
++    */
++   static int bvm_joblog = -1;
++   if (bvm_joblog < 0) {
++      const char *e = getenv("BVM_V3DV_JOBLOG");
++      bvm_joblog = (e && *e && *e != '0') ? 1 : 0;
++   }
++   if (bvm_joblog) {
++      struct timespec bts;
++      clock_gettime(CLOCK_MONOTONIC, &bts);
++      const struct v3dv_frame_tiling *t = &job->frame_tiling;
++      fprintf(stderr, "BVMJOB t_us=%llu rcl=0x%08x..0x%08x %ux%ux%u rt=%u bpp=%u "
++              "msaa=%d draws=%u transfer=%d rclB=%u bclB=%u susp=%d res=%d "
++              "ser=%d bclsync=%d flags=0x%x waits=%u sig=%d nbo=%u ls=%d pass=[%s]\n",
++              (unsigned long long)bts.tv_sec * 1000000ull + bts.tv_nsec / 1000,
++              submit.rcl_start, submit.rcl_end,
++              t->width, t->height, t->layers, t->render_target_count,
++              t->internal_bpp, t->msaa, job->draw_count, job->is_transfer,
++              submit.rcl_end - submit.rcl_start,
++              submit.bcl_end - submit.bcl_start,
++              job->suspending, job->resuming, job->serialize,
++              needs_bcl_sync, submit.flags, sync_info->wait_count,
++              signal_syncs, job->bo_count, job->bvm_loadstore_only,
++              job->bvm_desc);
++
++      /* BVM_V3DV_RCLDUMP=1: also dump the raw RCL/BCL bytes, tile allocation
++       * addresses and the GPU address range of every BO of draw-less
++       * LOAD/STORE jobs (=2: of every job), to compare hanging jobs with
++       * working jobs of the same shape (README item 106). */
++      static int bvm_rcldump = -1;
++      if (bvm_rcldump < 0) {
++         const char *e = getenv("BVM_V3DV_RCLDUMP");
++         bvm_rcldump = (e && *e) ? atoi(e) : 0;
++      }
++      /* BVM_V3DV_DUMPW=<n>: with RCLDUMP, only dump 24-byte-BCL jobs whose binning frame is n pixels wide */
++      static int bvm_dumpw = -1;
++      if (bvm_dumpw < 0) {
++         const char *e = getenv("BVM_V3DV_DUMPW");
++         bvm_dumpw = (e && *e) ? atoi(e) : 0;
++      }
++      bool bvm_w_ok = true;
++      if (bvm_dumpw > 0) {
++         const uint8_t *wb = (const uint8_t *)bcl_fist_bo->map;
++         bvm_w_ok = (submit.bcl_end - submit.bcl_start) == 24 && wb &&
++                    ((wb[7] | (wb[8] << 8)) + 1) == bvm_dumpw;
++      }
++      if (bvm_w_ok && (bvm_rcldump >= 2 ||
++          (bvm_rcldump == 1 && job->draw_count == 0 && job->bvm_loadstore_only))) {
++         const uint32_t rn = submit.rcl_end - submit.rcl_start;
++         const uint32_t bn = submit.bcl_end - submit.bcl_start;
++         fprintf(stderr, "BVMRCL rcl=0x%08x qma=0x%x qms=0x%x qts=0x%x bcl=0x%08x..0x%08x rclhex=",
++                 submit.rcl_start, job->tile_alloc->offset, job->tile_alloc->size,
++                 job->tile_state->offset, submit.bcl_start, submit.bcl_end);
++         const uint8_t *rp = (const uint8_t *)job->rcl.bo->map;
++         for (uint32_t i = 0; rp && i < rn && i < 512; i++)
++            fprintf(stderr, "%02x", rp[i]);
++         fprintf(stderr, " bclhex=");
++         const uint8_t *bp = (const uint8_t *)bcl_fist_bo->map;
++         for (uint32_t i = 0; bp && i < bn && i < 256; i++)
++            fprintf(stderr, "%02x", bp[i]);
++         fprintf(stderr, " bos=");
++         set_foreach(job->bos, entry) {
++            const struct v3dv_bo *bo = (const struct v3dv_bo *)entry->key;
++            fprintf(stderr, "%x:%x,", bo->offset, bo->size);
++         }
++         /* Contents of the sub-list(s) this BCL branches to (opcode 0x11 +
++          * 32-bit address = secondary command buffer), so the draws hidden
++          * behind "draws=0" jobs can be seen (README item 118). */
++         for (uint32_t i = 0; bp && i + 5 <= bn && i < 256; i++) {
++            if (bp[i] != 0x11)
++               continue;
++            const uint32_t a = bp[i + 1] | (bp[i + 2] << 8) | (bp[i + 3] << 16) |
++                               ((uint32_t)bp[i + 4] << 24);
++            set_foreach(job->bos, entry) {
++               const struct v3dv_bo *bo = (const struct v3dv_bo *)entry->key;
++               if (bo->map && a >= bo->offset && a < bo->offset + bo->size) {
++                  fprintf(stderr, " sub@%x(bo %x:%x)=", a, bo->offset, bo->size);
++                  const uint8_t *sp = (const uint8_t *)bo->map + (a - bo->offset);
++                  const uint32_t room = bo->size - (a - bo->offset);
++                  for (uint32_t k = 0; k < room && k < 384; k++)
++                     fprintf(stderr, "%02x", sp[k]);
++                  /* GL Shader State packet (0x40 + 32-bit address, low 5 bits =
++                   * number of attribute arrays): dump the record and the first
++                   * 64 bytes behind every pointer-looking word in it (vertex
++                   * buffers, uniforms), for the 24-byte-BCL jobs only. */
++                  if (bn == 24) {
++                     unsigned nrec = 0;   /* follow every GL Shader State record of the sub-list (max 4) */
++                     for (uint32_t k = 0; k + 5 <= room && k < 384; k++) {
++                        if (sp[k] != 0x40)
++                           continue;
++                        const uint32_t ra = (sp[k + 1] | (sp[k + 2] << 8) | (sp[k + 3] << 16) |
++                                             ((uint32_t)sp[k + 4] << 24)) & ~0x1fu;
++                        uint32_t rroom, rbo;
++                        const uint8_t *rp2 = bvm_job_map(job, ra, &rroom, &rbo);
++                        if (!rp2)
++                           continue;
++                        fprintf(stderr, " rec@%x=", ra);
++                        for (uint32_t q = 0; q < rroom && q < 192; q++)
++                           fprintf(stderr, "%02x", rp2[q]);
++                        for (uint32_t q = 0; q + 4 <= rroom && q < 192; q += 4) {
++                           const uint32_t v = rp2[q] | (rp2[q + 1] << 8) | (rp2[q + 2] << 16) |
++                                              ((uint32_t)rp2[q + 3] << 24);
++                           uint32_t proom, pbo;
++                           const uint8_t *pp = v >= 0x1000 ? bvm_job_map(job, v & ~7u, &proom, &pbo) : NULL;
++                           if (!pp)
++                              continue;
++                           fprintf(stderr, " ptr[%u]=%x(bo %x)=", q, v, pbo);
++                           /* the FS code (rec word 8) is dumped in full (1.5 KB) so it can be found in a
++                            * V3D_DEBUG=qpu listing of the same run */
++                           for (uint32_t z = 0; z < proom && z < (q == 8 ? 1536u : 64u); z++)
++                              fprintf(stderr, "%02x", pp[z]);
++                           /* second level, only for the 120x8 frame (or every job with
++                            * BVM_V3DV_DUMPUNI=1): the FS / VS uniform streams (rec words 12 / 20)
++                            * with the texture / sampler records they point to */
++                           static int bvm_dumpuni = -1;
++                           if (bvm_dumpuni < 0) {
++                              const char *e = getenv("BVM_V3DV_DUMPUNI");
++                              bvm_dumpuni = (e && *e == '1');
++                           }
++                           if ((q == 12 || q == 20) && (bvm_dumpuni || (bp[7] == 0x77 && bp[9] == 7))) {
++                              fprintf(stderr, q == 12 ? " FSUNI=" : " VSUNI=");
++                              for (uint32_t z = 0; z < proom && z < 256; z++)
++                                 fprintf(stderr, "%02x", pp[z]);
++                              unsigned np = 0;
++                              for (uint32_t z = 0; z + 4 <= proom && z < 256 && np < 12; z += 4) {
++                                 const uint32_t w = pp[z] | (pp[z + 1] << 8) | (pp[z + 2] << 16) |
++                                                    ((uint32_t)pp[z + 3] << 24);
++                                 uint32_t r3, b3;
++                                 const uint8_t *p3 = w >= 0x1000 ? bvm_job_map(job, w & ~15u, &r3, &b3) : NULL;
++                                 if (!p3)
++                                    continue;
++                                 np++;
++                                 fprintf(stderr, " u%c[%u]=%x(bo %x)=", q == 12 ? 'f' : 'v', z, w, b3);
++                                 for (uint32_t y = 0; y < r3 && y < 640; y++)
++                                    fprintf(stderr, "%02x", p3[y]);
++                              }
++                           }
++                        }
++                        k += 4;
++                        if (++nrec >= 4)
++                           break;
++                     }
++                  }
++                  break;
++               }
++            }
++         }
++         fprintf(stderr, "\n");
++      }
++   }
++
++   /* BVM_V3DV_MUTATE=<bitmask>: edit, just before submit, the one job shape that hangs in the
++    * replay (README item 119): 24-byte BCL = layers, 120x8 binning cfg, flush, start binning,
++    * occlusion, BRANCH_TO_SUB_LIST, flush; the sub-list has clip_window (0x6b at +18),
++    * Vertex Array Prims (0x24 at +83) and Return (0x12 at +93).
++    *   1 = make the draw empty (vertex count 0)
++    *   2 = clip window 120x8 -> 128x16 (the viewport size)
++    *   4 = clip window x 0, 64x8 (tile 0 only);  8 = clip window x 64, 56x8 (tile 1 only)
++    *  16 = 3 vertices instead of 4
++    *  32 = texture pointer of the FS TMU config += 0x40 (another texture record);  64 = sampler += 0x20
++    * 128 = color write masks all set;  256 = sample coverage mask 0
++    * 512 = FS record not 4-way threadable;  1024 = VS and CS records not 4-way threadable
++    * Only touches jobs of exactly that layout. Prints "BVMMUT n" on the first hit. */
++   /* BVM_V3DV_MUTATE2=<bitmask>: same idea for the second hang (README item 124): the 512x512 pass of DWM's
++    * shadow chain, 24-byte BCL, sub-list = draw 1 (shader state at +2, Vertex Array Prims at +79) and
++    * draw 2 (shader state at +91, Vertex Array Prims at +113), Return at +123.
++    *   1 = draw 1 empty;  2 = draw 2 empty;  4 = draw 1 sample mask 0;  8 = draw 2 sample mask 0
++    *  16 = draw 2 color write masks all set;  32 = draw 2 FS not 4-way threadable
++    *  64 = draw 2 texture pointer (first TMU config word of its FS uniforms) += 0x20 */
++   {
++      static int bvm_mut2 = -1;
++      static int bvm_mut2_hits;
++      if (bvm_mut2 < 0) {
++         const char *e = getenv("BVM_V3DV_MUTATE2");
++         bvm_mut2 = (e && *e) ? atoi(e) : 0;
++      }
++      const uint32_t m2bn = submit.bcl_end - submit.bcl_start;
++      const uint8_t *m2bp = (const uint8_t *)bcl_fist_bo->map;
++      if (bvm_mut2 && m2bn == 24 && m2bp && m2bp[0] == 0x77 && m2bp[2] == 0x78 && m2bp[7] == 0xff && m2bp[8] == 0x01 &&
++          m2bp[9] == 0xff && m2bp[10] == 0x01 && m2bp[18] == 0x11) {
++         const uint32_t a = m2bp[19] | (m2bp[20] << 8) | (m2bp[21] << 16) | ((uint32_t)m2bp[22] << 24);
++         uint32_t room, boff;
++         uint8_t *sp = (uint8_t *)bvm_job_map(job, a, &room, &boff);
++         /* layout A: two draws (draw 1 + the textured blur draw 2, Return at +123);
++          * layout B: only the blur draw (shader state at +2, Return at +89) */
++         const bool lay_a = sp && room > 124 && sp[0] == 0x47 && sp[2] == 0x40 && sp[14] == 0x6b && sp[79] == 0x24 &&
++                            sp[89] == 0x47 && sp[91] == 0x40 && sp[113] == 0x24 && sp[123] == 0x12;
++         const bool lay_b = sp && room > 90 && sp[0] == 0x47 && sp[2] == 0x40 && sp[14] == 0x6b && sp[79] == 0x24 &&
++                            sp[89] == 0x12;
++         if (lay_a || lay_b) {
++            /* offsets of "the blur draw" (draw 2 of layout A, the only draw of layout B) */
++            const int o_shader = lay_a ? 91 : 2, o_prims = lay_a ? 113 : 79, o_sample = lay_a ? 103 : 69, o_cwm = lay_a ? 108 : 74;
++            if (lay_a && (bvm_mut2 & 1)) sp[81] = sp[82] = sp[83] = sp[84] = 0;
++            if (bvm_mut2 & 2) sp[o_prims + 2] = sp[o_prims + 3] = sp[o_prims + 4] = sp[o_prims + 5] = 0;
++            if (lay_a && (bvm_mut2 & 4) && sp[69] == 0x5b) sp[70] = 0;
++            if ((bvm_mut2 & 8) && sp[o_sample] == 0x5b) sp[o_sample + 1] = 0;
++            if ((bvm_mut2 & 16) && sp[o_cwm] == 0x57) sp[o_cwm + 1] = sp[o_cwm + 2] = sp[o_cwm + 3] = sp[o_cwm + 4] = 0xff;
++            if (bvm_mut2 & (32 | 64)) {
++               const uint32_t ra = (sp[o_shader + 1] | (sp[o_shader + 2] << 8) | (sp[o_shader + 3] << 16) |
++                                    ((uint32_t)sp[o_shader + 4] << 24)) & ~0x1fu;
++               uint32_t rr, rb;
++               uint8_t *rec = (uint8_t *)(uintptr_t)bvm_job_map(job, ra, &rr, &rb);
++               if (rec && rr >= 32) {
++                  if (bvm_mut2 & 32) rec[8] &= ~1u;
++                  if (bvm_mut2 & 64) {
++                     const uint32_t ua = rec[12] | (rec[13] << 8) | (rec[14] << 16) | ((uint32_t)rec[15] << 24);
++                     uint32_t ur, ub;
++                     uint32_t *us = (uint32_t *)(uintptr_t)bvm_job_map(job, ua, &ur, &ub);
++                     /* the TMU texture pointer words end in 0x2f (see the uniform dump): += 0x20 */
++                     if (us && ur >= 64)
++                        for (int w = 0; w < 16; w++)
++                           if ((us[w] & 0xff) == 0x2f) { us[w] += 0x20; break; }
++                  }
++               }
++            }
++            if (bvm_mut2_hits++ < 3)
++               fprintf(stderr, "BVMMUT2 %d applied to job rcl=0x%08x\n", bvm_mut2, submit.rcl_start);
++         }
++      }
++   }
++
++   {
++      static int bvm_mut = -1;
++      static int bvm_mut_hits;
++      if (bvm_mut < 0) {
++         const char *e = getenv("BVM_V3DV_MUTATE");
++         bvm_mut = (e && *e) ? atoi(e) : 0;
++      }
++      const uint32_t mbn = submit.bcl_end - submit.bcl_start;
++      const uint8_t *mbp = (const uint8_t *)bcl_fist_bo->map;
++      if (bvm_mut && mbn == 24 && mbp && mbp[0] == 0x77 && mbp[2] == 0x78 &&
++          mbp[7] == 0x77 && mbp[8] == 0 && mbp[9] == 7 && mbp[10] == 0 && mbp[18] == 0x11) {
++         const uint32_t a = mbp[19] | (mbp[20] << 8) | (mbp[21] << 16) | ((uint32_t)mbp[22] << 24);
++         uint32_t room, boff;
++         uint8_t *sp = (uint8_t *)bvm_job_map(job, a, &room, &boff);
++         if (sp && room > 94 && sp[18] == 0x6b && sp[83] == 0x24 && sp[93] == 0x12) {
++            if (bvm_mut & 1) {
++               sp[85] = sp[86] = sp[87] = sp[88] = 0;   /* Length = 0 */
++            }
++            if (bvm_mut & 2) {
++               sp[23] = 0x80; sp[24] = 0x00;            /* width 128 */
++               sp[25] = 0x10; sp[26] = 0x00;            /* height 16 */
++            }
++            if (bvm_mut & 4) {                          /* clip: x 0, 64x8 (tile 0 only) */
++               sp[19] = sp[20] = 0; sp[23] = 64; sp[24] = 0; sp[25] = 8; sp[26] = 0;
++            }
++            if (bvm_mut & 8) {                          /* clip: x 64, 56x8 (tile 1 only) */
++               sp[19] = 64; sp[20] = 0; sp[23] = 56; sp[24] = 0; sp[25] = 8; sp[26] = 0;
++            }
++            if (bvm_mut & 16) {                         /* 3 vertices */
++               sp[85] = 3;
++            }
++            if ((bvm_mut & (512 | 1024)) && sp[2] == 0x40) {
++               /* shader record words 8/16/24 = FS/VS/CS code address | flags; bit 0 = 4-way threadable */
++               const uint32_t ra = (sp[3] | (sp[4] << 8) | (sp[5] << 16) | ((uint32_t)sp[6] << 24)) & ~0x1fu;
++               uint32_t rr, rb;
++               uint8_t *rec = (uint8_t *)(uintptr_t)bvm_job_map(job, ra, &rr, &rb);
++               if (rec && rr >= 32) {
++                  if (bvm_mut & 512) rec[8] &= ~1u;                 /* FS: not 4-way threadable */
++                  if (bvm_mut & 1024) { rec[16] &= ~1u; rec[24] &= ~1u; } /* VS, CS */
++               }
++            }
++            if ((bvm_mut & 128) && sp[78] == 0x57) {    /* color write masks: mask everything */
++               sp[79] = sp[80] = sp[81] = sp[82] = 0xff;
++            }
++            if ((bvm_mut & 256) && sp[73] == 0x5b) {    /* sample state: coverage mask 0 */
++               sp[74] = 0;
++            }
++            if (bvm_mut & (32 | 64)) {
++               /* GL Shader State packet is at sub-list +2; record word 12 = FS uniform stream;
++                * stream +116/+128 = TMU texture-state pointers (record array stride 0x20),
++                * +120 = sampler pointer (records 0x20 apart). */
++               if (sp[2] == 0x40) {
++                  const uint32_t ra = (sp[3] | (sp[4] << 8) | (sp[5] << 16) | ((uint32_t)sp[6] << 24)) & ~0x1fu;
++                  uint32_t rr, rb;
++                  const uint8_t *rec = bvm_job_map(job, ra, &rr, &rb);
++                  if (rec && rr >= 16) {
++                     const uint32_t ua = rec[12] | (rec[13] << 8) | (rec[14] << 16) | ((uint32_t)rec[15] << 24);
++                     uint32_t ur, ub;
++                     uint32_t *us = (uint32_t *)(uintptr_t)bvm_job_map(job, ua, &ur, &ub);
++                     if (us && ur >= 136) {
++                        uint32_t *p0a = &us[116 / 4], *sam = &us[120 / 4], *p0b = &us[128 / 4];
++                        if (*p0a == *p0b && (*p0a & 0x1f) == 0x0f) {
++                           if (bvm_mut & 32) { *p0a += 0x40; *p0b += 0x40; }
++                           if (bvm_mut & 64) { *sam += 0x20; }
++                           if (bvm_mut_hits < 3)
++                              fprintf(stderr, "BVMMUT tex=%x sampler=%x\n", *p0a, *sam);
++                        } else if (bvm_mut_hits < 3) {
++                           fprintf(stderr, "BVMMUT 32/64: unexpected uniform layout %x %x\n", *p0a, *p0b);
++                        }
++                     }
++                  }
++               }
++            }
++            if (bvm_mut_hits++ < 3)
++               fprintf(stderr, "BVMMUT %d applied to job rcl=0x%08x\n", bvm_mut, submit.rcl_start);
++         }
++      }
++   }
++
++   struct timespec bvm_ts0;
++   if (bvm_joblog)
++      clock_gettime(CLOCK_MONOTONIC, &bvm_ts0);
++
+    int ret = v3d_ioctl(device->pdevice->render_fd,
+                        DRM_IOCTL_V3D_SUBMIT_CL, &submit);
+ 
++   if (bvm_joblog) {
++      struct timespec bvm_ts1;
++      clock_gettime(CLOCK_MONOTONIC, &bvm_ts1);
++      long us = (bvm_ts1.tv_sec - bvm_ts0.tv_sec) * 1000000L +
++                (bvm_ts1.tv_nsec - bvm_ts0.tv_nsec) / 1000;
++      if (us > 5000)
++         fprintf(stderr, "BVMSLOWSUBMIT %ld us rcl=0x%08x\n", us, submit.rcl_start);
++   }
++
+    static bool warned = false;
+    if (ret && !warned) {
+       mesa_loge("Draw call returned %s. Expect corruption.\n",
+diff --git a/src/broadcom/vulkan/v3dvx_pipeline.c b/src/broadcom/vulkan/v3dvx_pipeline.c
+index 7b1fe4a..b0e006f 100644
+--- a/src/broadcom/vulkan/v3dvx_pipeline.c
++++ b/src/broadcom/vulkan/v3dvx_pipeline.c
+@@ -52,11 +52,17 @@ blend_factor(VkBlendFactor factor, bool dst_alpha_one, bool *needs_constants)
+    case VK_BLEND_FACTOR_ONE_MINUS_DST_ALPHA:
+       return dst_alpha_one ? V3D_BLEND_FACTOR_ZERO :
+                              V3D_BLEND_FACTOR_INV_DST_ALPHA;
++   /* Dual source blending is not supported by the hardware. Instead of
++    * hitting unreachable() (undefined behaviour in release builds: a garbage
++    * blend factor), approximate the second source with the first one's alpha. */
+    case VK_BLEND_FACTOR_SRC1_COLOR:
+-   case VK_BLEND_FACTOR_ONE_MINUS_SRC1_COLOR:
+    case VK_BLEND_FACTOR_SRC1_ALPHA:
++      fprintf(stderr, "v3dv: dual-source blend factor %d approximated\n", factor);
++      return VK_BLEND_FACTOR_SRC_ALPHA;
++   case VK_BLEND_FACTOR_ONE_MINUS_SRC1_COLOR:
+    case VK_BLEND_FACTOR_ONE_MINUS_SRC1_ALPHA:
+-      unreachable("Invalid blend factor: dual source blending not supported.");
++      fprintf(stderr, "v3dv: dual-source blend factor %d approximated\n", factor);
++      return VK_BLEND_FACTOR_ONE_MINUS_SRC_ALPHA;
+    default:
+       unreachable("Unknown blend factor.");
+    }

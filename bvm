@@ -229,34 +229,6 @@ remove_microsoft_defender() { #given mountpoint on $1, remove microsoft defender
   fi
 }
 
-remove_UCPD_from_mountpoint() { #force the specified windows installation to remove UCPD.sys file (to prevent bluescreen) - by botspot
-  #Fixes the BSOD reported in https://github.com/Botspot/bvm/issues/72
-  #To diagnose: boot, get it to crash, shutdown.
-  #find most recent crash dump in C:/Windows/Minidump
-  #copy it out and analyze on another computer:
-  
-  #Download WinDbg Preview from the Microsoft Store
-  #Open WinDbg, go to File > Open Crash Dump, select the .dmp file.
-  #Run: !analyze -v
-  #Look for: MODULE_NAME or IMAGE_NAME
-  
-  #In this case:
-  #MODULE_NAME: UCPD
-  #IMAGE_NAME:  UCPD.sys
-  
-  #workaround until fixed:
-  #boot-ramfb, F8 to get boot modes, 5 to boot in safe mode with networking
-  
-  #location of UCPD.sys: Windows/System32/drivers/UCPD.sys
-  
-  local mountpoint="$1"
-  if [ -e "$mountpoint/Windows/System32/drivers/UCPD.sys" ];then
-    if sudo rm -f "$mountpoint/Windows/System32/drivers/UCPD.sys" ;then
-      status_green "Successfully removed UCPD.sys from disk.qcow2"
-    fi
-  fi
-}
-
 download_windows_11arm64_22631() { #downloads older W11 version for ARMv8.0 CPUs such as the Raspberry Pi 4 or 3
   #from https://github.com/mattieb/windows-esd-to-iso/blob/main/windows-esd-to-iso
   #and from wor-flasher
@@ -472,18 +444,18 @@ patch_iso_noprompt() { # force the specified windows iso to not require keypress
     "991528:1720320:6ca7d07764a44c7015817a55eccb72fac4954599" # Fallback (Server 2025 v26470)
     "937948:1720320:5f192132f3491b3158d84bbc6150f0765e62a339" # Fallback (Server 2025 v26404)
   )
-
+  
   local expected_header='6zyQTVNETUYzLjIAAgIBAA=='
   local patched_successfully=false
-
+  
   status "Modifying Windows ISO to boot to installer without keypress:"
-
+  
   for variant in "${variants[@]}"; do
     # Parse the variables for the current variant
     IFS=':' read -r match_offset file_length expected_hash <<< "$variant"
     
     echo "  - Attempting patch with offset: $match_offset, length: $file_length..."
-
+    
     local extracted=false
     local match
     
@@ -510,7 +482,7 @@ patch_iso_noprompt() { # force the specified windows iso to not require keypress
       echo "  - Failed to extract efisys_noprompt.bin for this variant. Trying next..."
       continue
     fi
-
+    
     if [ "$(sha1sum /tmp/efisys_noprompt.bin | awk '{print $1}')" != "$expected_hash" ];then
       echo "  - The extracted efisys_noprompt.bin had an unexpected hash sum. Trying next..."
       rm -f /tmp/efisys_noprompt.bin
@@ -518,7 +490,7 @@ patch_iso_noprompt() { # force the specified windows iso to not require keypress
     fi
     
     echo "  - Checksums match! Now searching ISO for sections to replace..."
-
+    
     # 3. Replace efisys.bin instances with the extracted efisys_noprompt.bin
     local replaced=false
     while read match ;do
@@ -537,7 +509,7 @@ patch_iso_noprompt() { # force the specified windows iso to not require keypress
     
     # Cleanup tmp file
     rm -f /tmp/efisys_noprompt.bin
-
+    
     # 4. Check if the variant succeeded
     if [ "$replaced" = true ]; then
       echo "Done"
@@ -546,9 +518,9 @@ patch_iso_noprompt() { # force the specified windows iso to not require keypress
     else
       echo "  - Failed to find efisys.bin sections to replace for this variant. Trying next..."
     fi
-
+  
   done
-
+  
   # Final check if all variants failed
   if [ "$patched_successfully" = false ]; then
     error "Failed to patch ISO! None of the known efisys variants were successfully applied."
@@ -614,22 +586,8 @@ package_available() { #determine if the specified package-name exists in a local
 }
 
 install_dependencies() { #try to install everything BVM needs
-  required_commands="git jq wget mkisofs qemu-img qemu-system-aarch64 remmina nmap wget yad uuidgen wiminfo socat ntfsresize nc bc"
-  apt_packages="git jq wget genisoimage qemu-utils qemu-system-arm qemu-system-gui qemu-efi-aarch64 remmina remmina-plugin-rdp nmap wget yad uuid-runtime seabios ipxe-qemu wimtools socat ntfs-3g netcat-traditional bc"
-  
-  #using freerdp version 2 instead of 3 because it does not freeze on login and has more reliable clipboard sync
-  if [ "$XDG_SESSION_TYPE" == wayland ];then
-    #freerdp2 is not available on debian Trixie; rather than switch to freerdp3 and cause regressions, as remmina is better simply don't install freerdp2 if not found.
-    if package_available freerdp2-wayland ;then
-      required_commands+=" wlfreerdp"
-      apt_packages+=" freerdp2-wayland"
-    fi
-  else
-    if package_available freerdp2-x11 ;then
-      required_commands+=" xfreerdp"
-      apt_packages+=" freerdp2-x11"
-    fi
-  fi
+  required_commands="git jq wget mkisofs qemu-img qemu-system-aarch64 remmina nmap wget yad uuidgen wiminfo socat ntfsresize nc bc python3 smbd unzip 7z swtpm"
+  apt_packages="git jq wget genisoimage qemu-utils qemu-system-arm qemu-system-gui qemu-efi-aarch64 remmina remmina-plugin-rdp nmap wget yad uuid-runtime seabios ipxe-qemu wimtools socat ntfs-3g netcat-traditional bc python3 python3-pil samba unzip p7zip-full swtpm"
   
   #check if any commands are absent
   local IFS=' '
@@ -657,6 +615,9 @@ install_dependencies() { #try to install everything BVM needs
     installneeded=1
   elif [ ! -f /usr/lib/ipxe/qemu/pxe-virtio.rom ];then
     #ipxe-qemu is missing
+    installneeded=1
+  elif [ ! -d /usr/lib/python3/dist-packages/PIL ];then
+    #python3-pil is missing
     installneeded=1
   fi
   
@@ -756,8 +717,6 @@ copy_icons() { #install icons to a location where the panel will notice them
   mkdir -p ~/.local/share/icons/hicolor/scalable/apps
   if [ ! -f ~/.local/share/icons/hicolor/scalable/apps/bvm.png ];then
     ln -sf "$DIRECTORY/resources/graphics/icon.png" ~/.local/share/icons/hicolor/scalable/apps/qemu.png
-    ln -sf "$DIRECTORY/resources/graphics/icon.png" ~/.local/share/icons/hicolor/scalable/apps/wlfreerdp.png
-    ln -sf "$DIRECTORY/resources/graphics/icon.png" ~/.local/share/icons/hicolor/scalable/apps/xfreerdp.png
     ln -sf "$DIRECTORY/resources/graphics/icon.png" ~/.local/share/icons/hicolor/scalable/apps/bvm.png
   fi
   #for wf-panel-pi at least, updating icon caches seems to do no good
@@ -787,6 +746,20 @@ list_cores_to_use() { #Support big.LITTLE cpus such as RK3588. List the performa
   else
     #all cores were returned
     return 0
+  fi
+}
+
+nproc() { #Use only 2 compile threads on systems with little free RAM. Use it as: make -j$(nproc)
+  #adapted from pi-apps api, where it replaces the nproc command. Compiling QEMU and Mesa needs a lot of RAM.
+  
+  #memory available for starting new applications, without swapping
+  local available="$(free | grep 'Mem:' | awk '{print $7}')"
+  
+  if [ "$available" -lt $((4000*1024)) ];then
+    echo 2
+    warning "Your system has less than 4000MB of available RAM, so this will compile with only 2 threads."
+  else
+    command nproc
   fi
 }
 
@@ -828,6 +801,1135 @@ usb_passthrough_frontend() { #help the user add USB devices to be forwarded to t
   fi
 }
 export -f usb_passthrough_frontend #make available to clickhandler
+
+#GPU mode (experimental): pinned versions of everything it downloads. Repo and full commit hash (a shallow download needs the full hash). See dev/GPU-MODE-CHECKLIST.md
+gpu_qemu_repo="https://github.com/utmapp/qemu"
+gpu_qemu_commit=ae92cdc41fb0b0dab36c6ac724e1729ffc47ef18 #branch utm-edition
+gpu_virglrenderer_repo="https://github.com/utmapp/virglrenderer"
+gpu_virglrenderer_commit=cf5af71359b224a9a482e9b5a67f8160497dc951 #branch staging/neptune-linux of 2026-10-13
+gpu_dxvk_repo="https://github.com/osy/dxvk"
+gpu_dxvk_commit=e3386161a0fd2ae4ea3eaae0f559cf08ee705678 #the last one that still has dxvk_shared_resource.h, which virglrenderer needs
+gpu_dxbc_spirv_commit=0e79a703db8b23004c77dbabacf25ed2d41f0bd9 #a submodule of DXVK, only used to check its patch
+gpu_mesa_repo="https://gitlab.freedesktop.org/mesa/mesa.git"
+gpu_mesa_commit=742a20f48c59e8649533c84c4d49dd95b403f5da #tag mesa-25.0.7
+gpu_neptune_repo="https://github.com/osy/neptune-protocol"
+gpu_neptune_commit=0e0c939996c97885a482f6bfa67ae4f9ffad42a3 #tested with the Windows driver below (newer protocol commits exist, the wire version is still 2)
+gpu_triton_url="https://github.com/utmapp/viogpu-wddm/releases/download/v0.6/viogpu3d-arm64x-signed.zip" #the Windows driver, v0.6 tested on a Pi 5
+gpu_triton_sha256=723131a1d0a8b7f01037b7efe3b6ac7b90f034734460885fba0edd7d8c75425f
+gpu_spice_url="https://github.com/utmapp/viogpu-wddm/releases/download/v0.6/utm-guest-tools-0.1.276.exe" #UTM's guest tools installer, the only source of the SPICE agent (clipboard) for Windows on ARM
+gpu_spice_sha256=6a18d2fa717ba8bcd06e6d5f2e7eb12d2dd9be02d7f7280b102e3e1ad016ac76
+
+#every source tree that we patch (see resources/gpu-patches)
+gpu_components=(mesa dxvk dxbc-spirv virgl virgl-protocol qemu)
+
+#packages needed to compile GPU mode (not installed for everyone, only when GPU mode is set up)
+gpu_build_packages="build-essential meson ninja-build cmake pkg-config python3-mako python3-yaml python3-setuptools glslang-tools libvulkan-dev libepoxy-dev libdrm-dev libgbm-dev libegl-dev libgles-dev libx11-dev libxext-dev libglib2.0-dev libpixman-1-dev libgtk-3-dev libslirp-dev libpipewire-0.3-dev libusb-1.0-0-dev libfdt-dev libcap-ng-dev libattr1-dev libjpeg-dev libpng-dev libsdl2-dev libspice-protocol-dev libva-dev libunwind-dev libdw-dev libxkbcommon-dev unzip p7zip-full"
+
+gpu_hash() { #Input: any number of files or strings. Output: one sha256 that changes when any of them changes
+  local item
+  for item in "$@";do
+    if [ -f "$item" ];then
+      sha256sum < "$item"
+    else
+      echo "$item"
+    fi
+  done | sha256sum | awk '{print $1}'
+}
+
+gpu_run_step() { #Input: step name, hash of its inputs (from gpu_hash), name of the function to run. vmdir must be set.
+  #skips the step if it already finished with the same inputs. It is marked finished only if the function succeeded, so a failed or interrupted step just runs again.
+  #the function is given the hash as $1. The output is also saved to $vmdir/gpu/logs/
+  local step="$1"
+  local hash="$2"
+  local function_name="$3"
+  [ -z "$vmdir" ] && error "gpu_run_step: vmdir must be set"
+  mkdir -p "$vmdir/gpu/done" "$vmdir/gpu/logs" || error "gpu_run_step: failed to create folders in $vmdir/gpu"
+  
+  if [ "$(cat "$vmdir/gpu/done/$step" 2>/dev/null)" == "$hash" ];then
+    status "GPU: $step is already done"
+    return 0
+  fi
+  rm -f "$vmdir/gpu/done/$step"
+  
+  status "GPU: $step... (log: $vmdir/gpu/logs/$step.log)"
+  local start_time=$SECONDS
+  "$function_name" "$hash" 2>&1 | tee "$vmdir/gpu/logs/$step.log"
+  [ "${PIPESTATUS[0]}" != 0 ] && error "GPU: $step failed. See $vmdir/gpu/logs/$step.log"
+  
+  echo "$hash" > "$vmdir/gpu/done/$step"
+  status_green "GPU: $step finished in $((SECONDS-start_time)) seconds"
+}
+
+gpu_preflight() { #check this computer before the long GPU mode build, and exit with a list of everything that is wrong. vmdir must be set.
+  #only the Raspberry Pi 5 has been tested, so other boards just get a warning
+  [ -z "$vmdir" ] && error "gpu_preflight: vmdir must be set"
+  local problems=''
+  
+  grep -q 'Raspberry Pi 5' /proc/device-tree/model 2>/dev/null || warning "GPU mode has only been tested on the Raspberry Pi 5. Other boards with a Vulkan GPU might work."
+  
+  if ! find /dev/dri -name 'renderD*' -readable -writable 2>/dev/null | grep -q . ;then
+    problems+="\n - No usable GPU render node in /dev/dri/. Is your user in the render group?"
+  fi
+  [ "$(uname -r | awk -F'[.-]' '{print $1*1000+$2}')" -lt 6012 ] && warning "Kernel $(uname -r) is older than 6.12, which GPU mode was developed with."
+  
+  #compiling QEMU and Mesa needs memory. The builds use make -j$(nproc), which uses fewer threads when RAM is low
+  local total_gb=$(($(awk '/MemTotal|SwapTotal/ {sum+=$2} END {print sum}' /proc/meminfo)/1024/1024))
+  [ "$total_gb" -lt 4 ] && warning "Only $total_gb GB of RAM plus swap. Compiling will be slow and may still run out of memory. Consider enabling ZRAM."
+  
+  #the folder needs about 15 GB while building, only for the first build
+  mkdir -p "$vmdir/gpu" || error "gpu_preflight: failed to create $vmdir/gpu"
+  if [ ! -f "$vmdir/gpu/done/qemu" ] && [ "$(get_space_free "$vmdir/gpu")" -le $((15*1024*1024*1024)) ];then
+    problems+="\n - Less than 15 GB free for the GPU build in $vmdir/gpu"
+  fi
+  
+  #instead of a list of unsupported filesystems, try what the build and the VM need: symlinks, scripts, and unix sockets (qemu.sock)
+  rm -f "$vmdir/gpu/probe-link" "$vmdir/gpu/probe-script" "$vmdir/gpu/probe-socket" #leftovers of an interrupted run
+  ln -s target "$vmdir/gpu/probe-link" || problems+="\n - The filesystem of $vmdir/gpu cannot hold symbolic links"
+  echo -e '#!/bin/sh\nexit 0' > "$vmdir/gpu/probe-script"
+  chmod +x "$vmdir/gpu/probe-script"
+  "$vmdir/gpu/probe-script" || problems+="\n - Scripts cannot be run from $vmdir/gpu. Is it mounted noexec?"
+  python3 -I -c 'import socket,sys; socket.socket(socket.AF_UNIX).bind(sys.argv[1])' "$vmdir/gpu/probe-socket" || problems+="\n - A unix socket cannot be created in $vmdir/gpu. Unsupported filesystem or path too long?"
+  rm -f "$vmdir/gpu/probe-link" "$vmdir/gpu/probe-script" "$vmdir/gpu/probe-socket"
+  df -T "$vmdir/gpu" | grep -qE 'nfs|cifs|fuse|9p' && warning "$vmdir/gpu is on a network filesystem. It works, but compiling there is slow."
+  
+  #builds contain absolute paths, so if the VM folder was moved or renamed since the folder was created, delete it to compile everything again
+  if [ -f "$vmdir/gpu/location" ] && [ "$(cat "$vmdir/gpu/location")" != "$vmdir/gpu" ];then
+    warning "The VM folder was moved or renamed (the GPU files were built in $(cat "$vmdir/gpu/location")). Deleting them to compile again."
+    rm -rf "$vmdir/gpu" || error "gpu_preflight: failed to delete $vmdir/gpu"
+    mkdir -p "$vmdir/gpu" || error "gpu_preflight: failed to create $vmdir/gpu"
+  fi
+  echo "$vmdir/gpu" > "$vmdir/gpu/location"
+  
+  #network, only needed to download the sources (the qemu step is the last one of the setup)
+  if [ ! -f "$vmdir/gpu/done/qemu" ];then
+    local host
+    for host in github.com gitlab.freedesktop.org;do
+      wget -q --spider --timeout=10 --tries=1 "https://$host" || problems+="\n - Cannot reach https://$host to download the sources"
+    done
+  fi
+  
+  [ -z "$WAYLAND_DISPLAY" ] && warning "No Wayland session detected. The GPU window is made for Wayland."
+  id -nG | grep -qw pipewire || warning "Your user is not in the pipewire group, so QEMU's audio threads will not get priority. Fix: sudo usermod -aG pipewire $USER"
+  
+  [ ! -z "$problems" ] && error "GPU mode cannot be used yet:$problems"
+  status_green "GPU preflight passed"
+}
+
+gpu_patch_dir() { #Input: component name. Output: the source folder that its patch is for. vmdir must be set.
+  case "$1" in
+    mesa) echo "$vmdir/gpu/src/mesa" ;;
+    dxvk) echo "$vmdir/gpu/src/dxvk" ;;
+    dxbc-spirv) echo "$vmdir/gpu/src/dxvk/subprojects/dxbc-spirv" ;;
+    virgl) echo "$vmdir/gpu/src/virglrenderer" ;;
+    virgl-protocol) echo "$vmdir/gpu/src/virglrenderer/src/neptune/neptune-protocol" ;;
+    qemu) echo "$vmdir/gpu/src/qemu" ;;
+    *) error "gpu_patch_dir: unknown component '$1'. Choose from: ${gpu_components[*]}" ;;
+  esac
+}
+
+gpu_patch_base() { #Input: component name. Output: the commit that its patch was made against. (virgl-protocol is made against the generated headers instead)
+  case "$1" in
+    mesa) echo "$gpu_mesa_commit" ;;
+    dxvk) echo "$gpu_dxvk_commit" ;;
+    dxbc-spirv) echo "$gpu_dxbc_spirv_commit" ;;
+    virgl) echo "$gpu_virglrenderer_commit" ;;
+    qemu) echo "$gpu_qemu_commit" ;;
+  esac
+}
+
+gpu_patch_run() { #Input: component name. Apply that component's patch to its source folder.
+  local component="$1"
+  local patch_file="$DIRECTORY/resources/gpu-patches/bvm-$component.patch"
+  if [ "$component" == virgl-protocol ];then
+    #this folder is a part of the virglrenderer repository
+    git -C "$vmdir/gpu/src/virglrenderer" apply --whitespace=nowarn --directory=src/neptune/neptune-protocol "$patch_file"
+  else
+    git -C "$(gpu_patch_dir "$component")" apply --whitespace=nowarn "$patch_file"
+  fi
+}
+
+gpu_patch_generate() { #Input: component name. Output: a patch with everything that is different in its source folder compared to the base commit
+  local component="$1"
+  local folder="$(gpu_patch_dir "$component")"
+  
+  if [ "$component" == virgl-protocol ];then
+    #these headers are generated at build time, so compare them to what the generator made
+    local generated="$vmdir/gpu/src/neptune-protocol/builddir"
+    [ ! -d "$generated" ] && error "gpu_patch_generate: $generated does not exist. Build virglrenderer first."
+    local header
+    for header in "$folder"/npt_protocol_*.h ;do
+      header="$(basename "$header")"
+      [ -f "$generated/$header" ] || continue
+      cmp -s "$generated/$header" "$folder/$header" || diff -u --label "a/$header" --label "b/$header" "$generated/$header" "$folder/$header"
+    done
+    return 0
+  fi
+  
+  local base="$(gpu_patch_base "$component")"
+  git -C "$folder" rev-parse --verify -q "$base^{commit}" >/dev/null || error "gpu_patch_generate: commit $base was not found in $folder"
+  
+  #leave out what is not part of the patch, and add the new files that git does not know about yet
+  local excludes=()
+  local new_files=()
+  case "$component" in
+    dxvk)
+      excludes=(':(exclude)subprojects') #dxbc-spirv has its own patch
+      new_files=(src/dxvk/dxvk_tessemu.cpp src/dxvk/dxvk_tessemu.h)
+      ;;
+    virgl)
+      excludes=(':(exclude)src/neptune/neptune-protocol') #regenerated at build time, patched by virgl-protocol
+      ;;
+    qemu)
+      new_files=(ui/sdl2-clipboard.c)
+      ;;
+  esac
+  
+  #work in a temporary git index so the repository itself is not changed
+  local index="$(mktemp -u)"
+  local new_file
+  GIT_INDEX_FILE="$index" git -C "$folder" read-tree "$base" || error "gpu_patch_generate: git read-tree failed in $folder"
+  GIT_INDEX_FILE="$index" git -C "$folder" add -u -- . "${excludes[@]}" || error "gpu_patch_generate: git add failed in $folder"
+  for new_file in "${new_files[@]}" ;do
+    [ -e "$folder/$new_file" ] && GIT_INDEX_FILE="$index" git -C "$folder" add -f -- "$new_file"
+  done
+  GIT_INDEX_FILE="$index" git -C "$folder" diff --cached --binary --no-color --no-ext-diff "$base" -- . "${excludes[@]}"
+  rm -f "$index"
+}
+
+gpu_patch_apply() { #Input: component names (default: all). Apply our patches to freshly downloaded sources. A patch that was applied by an earlier (interrupted) run is skipped.
+  #There is no going back: gpu_git_clone downloads the sources again whenever a pin or a patch changed, so a patch only ever goes on top of the pinned commit.
+  local components=("$@")
+  [ -z "$1" ] && components=("${gpu_components[@]}")
+  local component
+  for component in "${components[@]}" ;do
+    local patch_file="$DIRECTORY/resources/gpu-patches/bvm-$component.patch"
+    local marker="$(git -C "$(gpu_patch_dir "$component")" rev-parse --absolute-git-dir)/bvm-patched-$component"
+    [ ! -s "$patch_file" ] && error "gpu_patch_apply: $patch_file does not exist"
+    if [ -f "$marker" ];then
+      echo "  - $component: patch already applied"
+      continue
+    fi
+    gpu_patch_run "$component" || error "gpu_patch_apply: the $component patch does not apply to $(gpu_patch_dir "$component"). If it was patched by hand, delete $vmdir/gpu/src and run gpu-setup again."
+    touch "$marker"
+    echo "  - $component: patch applied"
+  done
+}
+
+gpu_git_clone() { #Input: repo url, commit, destination folder, hash of the inputs of the step (from gpu_hash). Download only that one commit.
+  #if the folder is left from an earlier run with the same inputs, continue with it (keeps the compiled files). Otherwise start over.
+  local url="$1"
+  local commit="$2"
+  local destination="$3"
+  local inputs="$4"
+  if [ "$(git -C "$destination" rev-parse HEAD 2>/dev/null)" == "$commit" ] && [ "$(cat "$destination/.git/bvm-inputs" 2>/dev/null)" == "$inputs" ];then
+    echo "Continuing with the sources in $destination"
+    return 0
+  fi
+  
+  rm -rf "$destination"
+  mkdir -p "$destination" || error "gpu_git_clone: failed to create $destination"
+  status "Downloading $url ($commit)..."
+  git -C "$destination" init -q || error "gpu_git_clone: git init failed in $destination"
+  git -C "$destination" remote add origin "$url" || error "gpu_git_clone: git remote add failed in $destination"
+  git -C "$destination" fetch -q --depth 1 origin "$commit" || error "gpu_git_clone: failed to download commit $commit from $url. The repository may have been changed or removed."
+  git -C "$destination" checkout -q FETCH_HEAD || error "gpu_git_clone: git checkout failed in $destination"
+  #only now is the folder complete
+  echo "$inputs" > "$destination/.git/bvm-inputs"
+}
+
+gpu_sysroot_ldpath() { #Output: the library folders of our private install, each followed by a colon, for the start of LD_LIBRARY_PATH
+  find "$vmdir/gpu/sysroot" -type d \( -name aarch64-linux-gnu -o -name lib -o -name lib64 \) -path '*/lib*' 2>/dev/null | tr '\n' ':'
+}
+
+gpu_install_build_dependencies() { #install the packages that are needed to compile GPU mode, if any are missing
+  local IFS=' '
+  local package
+  local will_install=''
+  for package in $gpu_build_packages ;do
+    if ! package_installed "$package" ;then
+      will_install+=" $package"
+    fi
+  done
+  [ -z "$will_install" ] && return 0
+  
+  status "Installing the packages needed to compile GPU mode, please wait..."
+  export DEBIAN_FRONTEND=noninteractive
+  #run apt update only if necessary
+  if [ ! -f /var/cache/apt/pkgcache.bin ];then
+    sudo apt update
+  fi
+  sudo apt install -y $will_install || error "gpu_install_build_dependencies: APT failed to install:$will_install"
+}
+
+gpu_get_driver() { #download the Windows driver (Triton) that lets the guest use the GPU, and unpack it to $vmdir/gpu/drivers/viogpu3d
+  mkdir -p "$vmdir/gpu/drivers" || error "gpu_get_driver: failed to create $vmdir/gpu/drivers"
+  #bar:force keeps the progress bar on a single line even though the output is piped through tee
+  wget -q --show-progress --progress=bar:force:noscroll "$gpu_triton_url" -O "$vmdir/gpu/drivers/viogpu3d.zip" || error "gpu_get_driver: failed to download $gpu_triton_url"
+  if [ "$(sha256sum "$vmdir/gpu/drivers/viogpu3d.zip" | awk '{print $1}')" != "$gpu_triton_sha256" ];then
+    rm -f "$vmdir/gpu/drivers/viogpu3d.zip"
+    error "gpu_get_driver: the downloaded driver is not the one this version of BVM expects (checksum mismatch). Please report this issue."
+  fi
+  rm -rf "$vmdir/gpu/drivers/viogpu3d"
+  unzip -q -j "$vmdir/gpu/drivers/viogpu3d.zip" -d "$vmdir/gpu/drivers/viogpu3d" || error "gpu_get_driver: failed to unpack viogpu3d.zip"
+}
+
+gpu_build_mesa() { #Input: hash of the inputs. Download, patch and compile the Vulkan driver of the GPU (V3DV, from Mesa) into $vmdir/gpu/mesa
+  gpu_git_clone "$gpu_mesa_repo" "$gpu_mesa_commit" "$vmdir/gpu/src/mesa" "$1"
+  gpu_patch_apply mesa
+  local threads="$(nproc)"
+  
+  status "Compiling Mesa..."
+  if [ ! -f "$vmdir/gpu/src/mesa/builddir/build.ninja" ];then
+    meson setup "$vmdir/gpu/src/mesa/builddir" "$vmdir/gpu/src/mesa" -Dprefix="$vmdir/gpu/mesa" -Dbuildtype=release \
+      -Dvulkan-drivers=broadcom -Dgallium-drivers= -Dllvm=disabled -Dvulkan-layers= \
+      -Dplatforms=wayland -Dglx=disabled -Degl=disabled -Dgbm=disabled -Dgles1=disabled -Dgles2=disabled \
+      -Dopengl=false -Dvalgrind=disabled -Dlmsensors=disabled -Dtools= -Dvideo-codecs= || error "gpu_build_mesa: meson setup failed"
+  fi
+  ninja -C "$vmdir/gpu/src/mesa/builddir" -j"$threads" || error "gpu_build_mesa: compiling failed"
+  ninja -C "$vmdir/gpu/src/mesa/builddir" install || error "gpu_build_mesa: installing failed"
+  
+  #the Vulkan loader finds a driver through a json file, which has to name the library with its full path
+  local library="$(find "$vmdir/gpu/mesa" -name libvulkan_broadcom.so | head -n1)"
+  local icd_file="$(find "$vmdir/gpu/mesa" -name 'broadcom_icd*.json' | head -n1)"
+  [ -z "$library" ] && error "gpu_build_mesa: libvulkan_broadcom.so was not built"
+  [ -z "$icd_file" ] && error "gpu_build_mesa: Mesa did not install a broadcom_icd json file"
+  jq --arg path "$library" '.ICD.library_path = $path' "$icd_file" > "$vmdir/gpu/broadcom_icd.json" || error "gpu_build_mesa: failed to write $vmdir/gpu/broadcom_icd.json"
+}
+
+gpu_build_dxvk() { #Input: hash of the inputs. Download, patch and compile DXVK (turns Direct3D 11 into Vulkan on the host) into $vmdir/gpu/sysroot
+  gpu_git_clone "$gpu_dxvk_repo" "$gpu_dxvk_commit" "$vmdir/gpu/src/dxvk" "$1"
+  git -C "$vmdir/gpu/src/dxvk" submodule update --init --recursive --depth 1 || error "gpu_build_dxvk: failed to download the DXVK submodules"
+  gpu_patch_apply dxvk dxbc-spirv
+  local threads="$(nproc)"
+  
+  status "Compiling DXVK..."
+  if [ ! -f "$vmdir/gpu/src/dxvk/builddir/build.ninja" ];then
+    #native_headless satisfies the "one WSI required" check
+    meson setup "$vmdir/gpu/src/dxvk/builddir" "$vmdir/gpu/src/dxvk" \
+      -Dnative_headless=true -Dnative_sdl2=disabled -Dnative_sdl3=disabled -Dnative_glfw=disabled \
+      -Dbuildtype=release -Db_ndebug=true \
+      -Dc_args=-U_GLIBCXX_ASSERTIONS -Dcpp_args=-U_GLIBCXX_ASSERTIONS \
+      -Dprefix="$vmdir/gpu/sysroot/usr/local" || error "gpu_build_dxvk: meson setup failed"
+  fi
+  ninja -C "$vmdir/gpu/src/dxvk/builddir" -j"$threads" || error "gpu_build_dxvk: compiling failed"
+  ninja -C "$vmdir/gpu/src/dxvk/builddir" install || error "gpu_build_dxvk: installing failed"
+}
+
+gpu_build_virglrenderer() { #Input: hash of the inputs. Download, patch and compile virglrenderer with Neptune, which receives the guest's graphics commands
+  gpu_git_clone "$gpu_virglrenderer_repo" "$gpu_virglrenderer_commit" "$vmdir/gpu/src/virglrenderer" "$1"
+  gpu_git_clone "$gpu_neptune_repo" "$gpu_neptune_commit" "$vmdir/gpu/src/neptune-protocol" "$1"
+  gpu_patch_apply virgl
+  local threads="$(nproc)"
+  
+  #the protocol headers that come with virglrenderer are older than the Windows driver. Both say "wire version 2", so nothing notices the difference.
+  #generate the host headers from the protocol repository instead, and put them over the old ones
+  status "Generating the Neptune protocol headers..."
+  rm -rf "$vmdir/gpu/src/neptune-protocol/builddir"
+  meson setup "$vmdir/gpu/src/neptune-protocol/builddir" "$vmdir/gpu/src/neptune-protocol" || error "gpu_build_virglrenderer: meson setup failed for neptune-protocol"
+  meson compile -C "$vmdir/gpu/src/neptune-protocol/builddir" npt_protocol_host npt_protocol_directx_types || error "gpu_build_virglrenderer: failed to generate the protocol headers"
+  find "$vmdir/gpu/src/neptune-protocol/builddir" -maxdepth 1 -name 'npt_protocol_*.h' -exec cp -t "$vmdir/gpu/src/virglrenderer/src/neptune/neptune-protocol" {} + || error "gpu_build_virglrenderer: failed to copy the protocol headers"
+  #the headers were just replaced, so their patch goes on again even if an interrupted run had applied it to the old ones
+  rm -f "$vmdir/gpu/src/virglrenderer/.git/bvm-patched-virgl-protocol"
+  gpu_patch_apply virgl-protocol
+  
+  status "Compiling virglrenderer..."
+  #neptune needs the DXVK headers and pkg-config files that were installed in our private folder
+  export PKG_CONFIG_PATH="$(find "$vmdir/gpu/sysroot" -type d -name pkgconfig | tr '\n' ':')$PKG_CONFIG_PATH"
+  if [ ! -f "$vmdir/gpu/src/virglrenderer/builddir/build.ninja" ];then
+    #platforms=egl: without EGL/GBM the build silently falls back to GLX only, and the guest hangs at the firmware
+    #-Wno-error=pedantic: vrend_renderer.c does not compile with GCC 14 otherwise
+    meson setup "$vmdir/gpu/src/virglrenderer/builddir" "$vmdir/gpu/src/virglrenderer" -Dneptune=true -Dvenus=true -Dtests=false -Dplatforms=egl \
+      -Dc_args=-Wno-error=pedantic -Dcpp_args=-Wno-error=pedantic -Dprefix="$vmdir/gpu/sysroot/usr/local" || error "gpu_build_virglrenderer: meson setup failed"
+  fi
+  ninja -C "$vmdir/gpu/src/virglrenderer/builddir" -j"$threads" || error "gpu_build_virglrenderer: compiling failed"
+  ninja -C "$vmdir/gpu/src/virglrenderer/builddir" install || error "gpu_build_virglrenderer: installing failed"
+}
+
+gpu_build_qemu() { #Input: hash of the inputs. Download, patch and compile QEMU with the GPU device into $vmdir/gpu/sysroot. It needs virglrenderer first.
+  gpu_git_clone "$gpu_qemu_repo" "$gpu_qemu_commit" "$vmdir/gpu/src/qemu" "$1"
+  gpu_patch_apply qemu
+  local threads="$(nproc)"
+  
+  status "Compiling QEMU..."
+  export PKG_CONFIG_PATH="$(find "$vmdir/gpu/sysroot" -type d -name pkgconfig | tr '\n' ':')$PKG_CONFIG_PATH"
+  export LD_LIBRARY_PATH="$(gpu_sysroot_ldpath)$LD_LIBRARY_PATH"
+  mkdir -p "$vmdir/gpu/src/qemu/build" || error "gpu_build_qemu: failed to create the build folder"
+  cd "$vmdir/gpu/src/qemu/build" || error "gpu_build_qemu: failed to enter the build folder"
+  ../configure --prefix="$vmdir/gpu/sysroot" --target-list=aarch64-softmmu \
+    --disable-werror --disable-docs --enable-plugins \
+    --enable-kvm --enable-opengl --enable-virglrenderer --enable-gtk --enable-gtk-clipboard --enable-pipewire --enable-slirp --enable-libusb || error "gpu_build_qemu: configure failed"
+  ninja -j"$threads" || error "gpu_build_qemu: compiling failed"
+  ninja install || error "gpu_build_qemu: installing failed"
+  
+  #make sure this QEMU has the GPU device with the Neptune option
+  local gpu_device_help="$("$vmdir/gpu/sysroot/bin/qemu-system-aarch64" -device virtio-gpu-gl-pci,help 2>&1)"
+  echo "$gpu_device_help" | grep -q neptune || error "gpu_build_qemu: the new QEMU has no virtio-gpu-gl-pci device with a neptune option. Is it the wrong branch?"
+}
+
+gpu_get_spice_agent() { #download the SPICE agent for Windows on ARM (clipboard sync) and unpack it to $vmdir/gpu/spice-agent
+  #there is no other source for the ARM64 build than UTM's guest tools installer, which is a 7-Zip readable archive. It is not kept, to save 80 MB.
+  mkdir -p "$vmdir/gpu/spice-agent" || error "gpu_get_spice_agent: failed to create $vmdir/gpu/spice-agent"
+  wget -q --show-progress --progress=bar:force:noscroll "$gpu_spice_url" -O "$vmdir/gpu/spice-agent/guest-tools.exe" || error "gpu_get_spice_agent: failed to download $gpu_spice_url"
+  if [ "$(sha256sum "$vmdir/gpu/spice-agent/guest-tools.exe" | awk '{print $1}')" != "$gpu_spice_sha256" ];then
+    rm -f "$vmdir/gpu/spice-agent/guest-tools.exe"
+    error "gpu_get_spice_agent: the downloaded installer is not the one this version of BVM expects (checksum mismatch). Please report this issue."
+  fi
+  
+  7z e -y -o"$vmdir/gpu/spice-agent" "$vmdir/gpu/spice-agent/guest-tools.exe" ARM64/vdagent.exe ARM64/vdservice.exe >/dev/null || error "gpu_get_spice_agent: failed to unpack the guest tools installer"
+  rm -f "$vmdir/gpu/spice-agent/guest-tools.exe"
+  [ -f "$vmdir/gpu/spice-agent/vdagent.exe" ] && [ -f "$vmdir/gpu/spice-agent/vdservice.exe" ] || error "gpu_get_spice_agent: vdagent.exe and vdservice.exe were not in the installer"
+}
+
+gpu_firmware_logo() { #Input: the stock firmware file, the file to write, a PNG. Replace the TianoCore boot logo in an EDK2 ArmVirt QEMU firmware (QEMU_EFI.fd) with the PNG, without recompiling it.
+  #The stock file is only read (writing to the same file, a link to it, is refused). Exit status: 0 done, 2 bad usage or image, 3 the firmware has another layout than this was made for (keep using the stock file), 1 anything else.
+  #How it works: the logo is one image in the HII resource of the LogoDxe driver, which lives in the LZMA-compressed DXE volume (FFS FVMAIN_COMPACT). The stock image is 8-bit paletted (256 colours).
+  #The volume is decompressed, and the image replaced by a 24-bit one at the size of the PNG. That makes the PE resource section of the driver bigger: .rsrc grows, .reloc shifts, the PE headers, the LogoDxe file,
+  #the files behind it and the volume (length, block map, header checksum) follow. A picture that does not fit that way is stored in the 8-bit palette (dithered) instead. Then the volume is compressed again,
+  #the outer file record is rebuilt in the free space behind it, and the output is read back to prove that it decodes to the picture. Transparency becomes black (the firmware draws on black).
+  #Only the firmware of Debian 12 and 13 has been tried. Works entirely in memory, the only file written is the output (deleted again if writing fails).
+  python3 -I - "$@" <<'PYTHON'
+import lzma
+import os
+import struct
+import sys
+import uuid
+
+try:
+    from PIL import Image
+except ImportError:
+    sys.exit('gpu_firmware_logo: Pillow is required (python3-pil)')
+
+OUTER_GUID = uuid.UUID('9e21fd93-9c72-4c15-8c4b-e77f1db2d792').bytes_le   # FVMAIN_COMPACT: the compressed DXE volume
+LZMA_GUID = uuid.UUID('ee4e5898-3914-4259-9d6e-dc7bd79403cf').bytes_le    # GUID-defined section: plain LZMA "alone" stream
+LOGO_GUID = uuid.UUID('f74d20ee-37e7-48fc-97f7-9b1047749c69').bytes_le    # LogoDxe
+MAX_SIDE = 2048                                                           # sanity limit for the size of the picture
+
+
+class Unsupported(Exception):
+    """The firmware is not laid out the way this script expects."""
+
+
+class BadImage(Exception):
+    pass
+
+
+def u16(b, o): return struct.unpack_from('<H', b, o)[0]
+def u32(b, o): return struct.unpack_from('<I', b, o)[0]
+def u24(b, o): return b[o] | b[o + 1] << 8 | b[o + 2] << 16
+
+
+def need(cond, why):
+    if not cond:
+        raise Unsupported(why)
+
+
+# ---------------------------------------------------------------- firmware file system (FFS) helpers
+def ffs_checks(hdr, data, with_data_checksum):
+    """Header checksum and file (data) checksum for a 24-byte FFS header; State (byte 23) and both checksum bytes count as zero."""
+    h = bytearray(hdr[:24])
+    h[16] = h[17] = h[23] = 0
+    hc = (0x100 - (sum(h) & 0xff)) & 0xff
+    fc = ((0x100 - (sum(data) & 0xff)) & 0xff) if with_data_checksum else 0xAA
+    return hc, fc
+
+
+def check_ffs(buf, off, name):
+    """Validate the FFS header at buf[off] (checksums must match, so a false GUID hit is rejected). Returns its total size."""
+    need(off >= 0 and off + 24 <= len(buf), name + ': header outside the image')
+    size = u24(buf, off + 20)
+    need(24 < size < 0xffffff and off + size <= len(buf), name + ': implausible size (large files are not supported)')
+    hc, fc = ffs_checks(buf[off:off + 24], buf[off + 24:off + size], bool(buf[off + 19] & 0x40))
+    need((hc, fc) == (buf[off + 16], buf[off + 17]), name + ': checksums do not match (layout differs from what was tested)')
+    return size
+
+
+def refresh_ffs(buf, off, size):
+    """Store a new total size and recompute both checksums of the FFS at buf[off]."""
+    buf[off + 20:off + 23] = size.to_bytes(3, 'little')
+    hc, fc = ffs_checks(buf[off:off + 24], buf[off + 24:off + size], bool(buf[off + 19] & 0x40))
+    buf[off + 16], buf[off + 17] = hc, fc
+
+
+# ---------------------------------------------------------------- locating the logo
+def find_ffs(buf, guid, name):
+    pos = -1
+    while True:
+        pos = buf.find(guid, pos + 1)
+        need(pos >= 0, name + ' not found')
+        try:
+            return pos, check_ffs(buf, pos, name)
+        except Unsupported:
+            continue   # the GUID bytes occurred inside data, keep looking
+
+
+def decompress_outer(fd):
+    """Return (outer ffs offset, ffs size, section header offset, section size, data offset in section, lzma header, DXE volume bytes)."""
+    o, osize = find_ffs(fd, OUTER_GUID, 'FVMAIN_COMPACT')
+    sec = o + 24
+    need(fd[sec + 3] == 0x02 and bytes(fd[sec + 4:sec + 20]) == LZMA_GUID, 'compressed volume is not a plain-LZMA GUID-defined section')
+    ssz = u24(fd, sec)
+    need(4 + 20 <= ssz and sec + ssz <= o + osize, 'bad section size')
+    dataoff = u16(fd, sec + 20)
+    need(24 <= dataoff < ssz, 'bad section data offset')
+    stream = bytes(fd[sec + dataoff:sec + ssz])
+    need(len(stream) > 13, 'LZMA stream too short')
+    expected = struct.unpack_from('<Q', stream, 5)[0]
+    dec = lzma.LZMADecompressor(format=lzma.FORMAT_ALONE)
+    try:
+        raw = dec.decompress(stream)
+    except lzma.LZMAError as e:
+        raise Unsupported('cannot decompress the DXE volume: %s' % e)
+    need(len(raw) == expected, 'decompressed size differs from the stream header')
+    return o, osize, sec, ssz, dataoff, stream[:13], bytearray(raw)
+
+
+def pe_layout(pe):
+    """Parse the parts of a PE32/PE32+ image that matter here: section table, resource directory and the HII package list inside it.
+    Returns a dict (all offsets are file offsets inside `pe`)."""
+    need(pe[:2] == b'MZ', 'LogoDxe section is not a PE image')
+    lfa = u32(pe, 0x3c)
+    need(pe[lfa:lfa + 4] == b'PE\0\0', 'no PE signature')
+    nsec, optsz = u16(pe, lfa + 6), u16(pe, lfa + 20)
+    opt = lfa + 24
+    magic = u16(pe, opt)
+    dirs = opt + (112 if magic == 0x20b else 96)
+    t = opt + optsz
+    secs = []
+    for i in range(nsec):
+        name = bytes(pe[t + i * 40:t + i * 40 + 8]).rstrip(b'\0')
+        vs, va, rs, ro = struct.unpack_from('<IIII', pe, t + i * 40 + 8)
+        secs.append(dict(name=name, hdr=t + i * 40, vs=vs, va=va, rs=rs, ro=ro))
+
+    def rva2off(rva):
+        for s in secs:
+            if s['va'] <= rva < s['va'] + max(s['vs'], s['rs']):
+                return s['ro'] + rva - s['va']
+        raise Unsupported('resource RVA outside the sections')
+
+    rrva, rsize = u32(pe, dirs + 16), u32(pe, dirs + 20)
+    need(rrva and rsize, 'LogoDxe has no resource directory')
+    base = rva2off(rrva)
+    leaves = []
+
+    def walk(off, depth):
+        need(depth < 4, 'resource tree too deep')
+        nn, ni = u16(pe, base + off + 12), u16(pe, base + off + 14)
+        for i in range(nn + ni):
+            tgt = u32(pe, base + off + 16 + i * 8 + 4)
+            if tgt & 0x80000000:
+                walk(tgt & 0x7fffffff, depth + 1)
+            else:
+                rva, size = struct.unpack_from('<II', pe, base + tgt)
+                leaves.append((rva2off(rva), size, base + tgt))
+    walk(0, 0)
+    for off, size, entry in leaves:
+        if size > 24 and u32(pe, off + 16) == size:       # HII package list header: GUID, then its own total length
+            return dict(secs=secs, opt=opt, dirs=dirs, hii_off=off, hii_size=size, leaf_entry=entry)
+    raise Unsupported('no HII package list in the resources')
+
+
+def pe_resource_hii(pe):
+    """(file offset, size) of the HII package list in the PE image's resources."""
+    lay = pe_layout(pe)
+    return lay['hii_off'], lay['hii_size']
+
+
+def logo_sections(raw):
+    """Locate LogoDxe in the decompressed DXE volume. Returns (ffs offset, ffs size, [(section type, payload)], index of the PE32 section)."""
+    lo, lsize = find_ffs(raw, LOGO_GUID, 'LogoDxe')
+    q, secs, pe_idx = lo + 24, [], None
+    while q + 4 <= lo + lsize:
+        s = u24(raw, q)
+        need(s >= 4 and q + s <= lo + lsize, 'bad section size in LogoDxe')
+        if raw[q + 3] == 0x10:
+            pe_idx = len(secs)
+        secs.append((raw[q + 3], bytes(raw[q + 4:q + s])))
+        q = (q + s + 3) & ~3
+    need(pe_idx is not None, 'LogoDxe has no PE32 section')
+    return lo, lsize, secs, pe_idx
+
+
+def locate_image(raw):
+    """Where the logo's picture is inside the decompressed DXE volume. kind is 8 (paletted, `pal`/`ncolors` set) or 24 (truecolor)."""
+    lo, lsize = find_ffs(raw, LOGO_GUID, 'LogoDxe')
+    q, pe, pe_len = lo + 24, None, 0
+    while q + 4 <= lo + lsize:
+        s = u24(raw, q)
+        need(s >= 4, 'bad section size in LogoDxe')
+        if raw[q + 3] == 0x10:
+            pe, pe_len = q + 4, s - 4
+        q = (q + s + 3) & ~3
+    need(pe is not None, 'LogoDxe has no PE32 section')
+    hoff, hsize = pe_resource_hii(bytes(raw[pe:pe + pe_len]))
+    res = pe + hoff
+    p = res + 20
+    pkg = None
+    while p + 4 <= res + hsize:
+        plen, ptype = u24(raw, p), raw[p + 3]
+        if ptype == 0xdf or plen < 4:
+            break
+        if ptype == 0x06:
+            pkg = p
+            break
+        p += plen
+    need(pkg is not None, 'no IMAGES package')
+    info, pal = struct.unpack_from('<II', raw, pkg + 4)
+    blk = pkg + info
+    kind = {0x14: 8, 0x16: 24}.get(raw[blk])
+    need(kind is not None, 'logo is neither an 8-bit nor a 24-bit image block (type 0x%02x)' % raw[blk])
+    if kind == 24:
+        w, h = struct.unpack_from('<HH', raw, blk + 1)
+        pix = blk + 5
+        need(pix + w * h * 3 <= res + hsize, 'image data outside the resource')
+        return dict(kind=24, logo=lo, logo_size=lsize, w=w, h=h, pix=pix)
+    w, h = struct.unpack_from('<HH', raw, blk + 2)
+    pix = blk + 6
+    palo = pkg + pal
+    need(u16(raw, palo) == 1, 'unexpected palette count')
+    psize = u16(raw, palo + 2)
+    need(psize % 3 == 0 and 3 <= psize <= 768, 'unexpected palette size')
+    need(pix + w * h <= res + hsize and palo + 4 + psize <= res + hsize, 'image data outside the resource')
+    return dict(kind=8, logo=lo, logo_size=lsize, w=w, h=h, pix=pix, pal=palo + 4, ncolors=psize // 3)
+
+
+# ---------------------------------------------------------------- the picture
+def load_picture(path):
+    """The picture as an RGB image: transparency on black, at its own size."""
+    try:
+        im = Image.open(path)
+        im.load()
+    except Exception as e:
+        raise BadImage('cannot read %s: %s' % (path, e))
+    if im.mode in ('RGBA', 'LA') or (im.mode == 'P' and 'transparency' in im.info):
+        im = im.convert('RGBA')
+        bg = Image.new('RGBA', im.size, (0, 0, 0, 255))   # the firmware draws on a black screen
+        im = Image.alpha_composite(bg, im)
+    im = im.convert('RGB')
+    if max(im.size) > MAX_SIDE:
+        raise BadImage('%dx%d is too large (limit %d)' % (im.size[0], im.size[1], MAX_SIDE))
+    return im
+
+
+def to_palette(im, ncolors):
+    """(pixel indices, palette bytes RGB) for an at-most-`ncolors` palette."""
+    Dither = getattr(Image, 'Dither', Image)
+    Quant = getattr(Image, 'Quantize', Image)
+    if len(set(im.getdata())) <= ncolors:
+        q = im.quantize(colors=ncolors, dither=Dither.NONE)          # fits: stored exactly
+    else:
+        # Pillow only dithers when it is given a palette: build the best palette first (max coverage keeps rare saturated
+        # colours), then map the picture onto it with Floyd-Steinberg error diffusion so gradients do not band.
+        base = im.quantize(colors=ncolors, method=Quant.MAXCOVERAGE, dither=Dither.NONE)
+        q = im.quantize(palette=base, dither=Dither.FLOYDSTEINBERG)
+    pal = bytes(q.getpalette()[:ncolors * 3]).ljust(ncolors * 3, b'\0')
+    return bytes(q.getdata()), pal
+
+
+def to_bgr(im):
+    """Truecolor pixels in the firmware's order: blue, green, red per pixel."""
+    out = bytearray()
+    for r, g, b in im.getdata():
+        out += bytes((b, g, r))
+    return bytes(out)
+
+
+# ---------------------------------------------------------------- the two ways of putting the picture into the volume
+def apply_palette(raw, img, pixels, rgb):
+    """In place: same sizes, nothing moves."""
+    w, h, nc = img['w'], img['h'], img['ncolors']
+    raw[img['pix']:img['pix'] + w * h] = pixels
+    for i in range(nc):   # firmware palette entries are blue, green, red
+        r, g, b = rgb[i * 3:i * 3 + 3]
+        raw[img['pal'] + i * 3:img['pal'] + i * 3 + 3] = bytes((b, g, r))
+    refresh_ffs(raw, img['logo'], img['logo_size'])
+    return raw
+
+
+def fv_header_checksum(buf, fvh):
+    """Recompute the 16-bit header checksum of the firmware volume at buf[fvh] in place."""
+    hl = u16(buf, fvh + 48)
+    buf[fvh + 50:fvh + 52] = b'\0\0'
+    s = sum(struct.unpack_from('<%dH' % (hl // 2), buf, fvh)) & 0xffff
+    buf[fvh + 50:fvh + 52] = struct.pack('<H', (0x10000 - s) & 0xffff)
+
+
+def apply_truecolor(raw, w, h, bgr):
+    """Replace the logo by a w x h 24-bit image. The PE resource section grows (by whole 4 KiB pages), so everything behind it moves:
+    .reloc and the PE headers, the LogoDxe file, the following files in the DXE volume, the volume header. Returns the new volume bytes."""
+    need(1 <= w <= 0xffff and 1 <= h <= 0xffff, 'bad image size')
+    lo, lsize, secs, pe_idx = logo_sections(raw)
+    pe = bytearray(secs[pe_idx][1])
+    lay = pe_layout(bytes(pe))
+    by_name = {s['name']: s for s in lay['secs']}
+    need(b'.rsrc' in by_name and b'.reloc' in by_name, 'PE has no .rsrc/.reloc')
+    rs, rl = by_name[b'.rsrc'], by_name[b'.reloc']
+    need(rs['ro'] + rs['rs'] == rl['ro'] and rs['va'] + rs['rs'] == rl['va'] and rl['ro'] + rl['rs'] == len(pe),
+         '.rsrc is not directly followed by .reloc at the end of the image')
+    opt, dirs = lay['opt'], lay['dirs']
+    need(u32(pe, dirs + 16) == rs['va'] and u32(pe, dirs + 40) == rl['va'], 'data directories do not match the sections')
+    need(u32(pe, opt + 32) == 0x1000 and u32(pe, opt + 36) == 0x1000, 'unexpected PE alignment')
+    data_off = lay['hii_off'] - rs['ro']
+    old_size = lay['hii_size']
+    rsrc = bytearray(pe[rs['ro']:rs['ro'] + rs['rs']])
+    need(not any(rsrc[data_off + old_size:]), 'the HII data is not the last thing in .rsrc')
+    guid = bytes(rsrc[data_off:data_off + 16])
+
+    # new HII package list: one 24-bit image block (type 0x16: width, height, B/G/R pixels), the end-of-blocks byte, no palette
+    block = bytes([0x16]) + struct.pack('<HH', w, h) + bgr + b'\x00'
+    body = struct.pack('<II', 12, 0) + block
+    pkg = (4 + len(body)).to_bytes(3, 'little') + b'\x06' + body
+    data = guid + struct.pack('<I', 20 + len(pkg) + 4) + pkg + b'\x04\x00\x00\xdf'
+    new_rs = max((data_off + len(data) + 0xfff) & ~0xfff, rs['rs'])       # never shrink: nothing behind us has to move back
+    grow = new_rs - rs['rs']
+    nrsrc = bytearray(new_rs)
+    nrsrc[:data_off] = rsrc[:data_off]
+    nrsrc[data_off:data_off + len(data)] = data
+    entry = lay['leaf_entry'] - rs['ro']                                   # IMAGE_RESOURCE_DATA_ENTRY: rva, size, codepage, reserved
+    need(u32(nrsrc, entry + 4) == old_size, 'resource data entry not where expected')
+    nrsrc[entry + 4:entry + 8] = struct.pack('<I', len(data))
+
+    npe = bytearray(pe[:rs['ro']]) + nrsrc + bytearray(pe[rl['ro']:rl['ro'] + rl['rs']])
+    struct.pack_into('<II', npe, rs['hdr'] + 8, new_rs, rs['va'])           # .rsrc VirtualSize, VirtualAddress
+    struct.pack_into('<II', npe, rs['hdr'] + 16, new_rs, rs['ro'])          # SizeOfRawData, PointerToRawData
+    struct.pack_into('<IIII', npe, rl['hdr'] + 8, rl['vs'], rl['va'] + grow, rl['rs'], rl['ro'] + grow)   # .reloc moves behind it
+    struct.pack_into('<I', npe, opt + 56, u32(pe, opt + 56) + grow)         # SizeOfImage
+    struct.pack_into('<I', npe, opt + 8, u32(pe, opt + 8) + grow)           # SizeOfInitializedData
+    struct.pack_into('<I', npe, dirs + 20, new_rs)                          # resource directory size
+    struct.pack_into('<I', npe, dirs + 40, rl['va'] + grow)                 # base relocation directory RVA
+
+    # the LogoDxe file with the bigger PE section
+    ffs = bytearray(raw[lo:lo + 24])
+    for i, (stype, payload) in enumerate(secs):
+        pl = bytes(npe) if i == pe_idx else payload
+        sz = 4 + len(pl)
+        need(sz < 0xffffff, 'LogoDxe section too large')
+        while len(ffs) % 4:
+            ffs += b'\0'
+        ffs += sz.to_bytes(3, 'little') + bytes([stype]) + pl
+    new_lsize = len(ffs)
+    need(new_lsize < 0xffffff, 'LogoDxe file too large')
+    refresh_ffs(ffs, 0, new_lsize)
+    old_end = (lo + lsize + 7) & ~7
+    blob = bytes(ffs) + b'\0' * (-new_lsize % 8)
+    delta = len(blob) - (old_end - lo)
+    need(delta >= 0 and delta % 0x40 == 0, 'unexpected size change of the LogoDxe file')
+    # nothing in the files that move may demand an alignment this shift would break: walk them and check their alignment attributes
+    fvh = raw.find(b'_FVH') - 40
+    need(fvh == 0x10 and raw[0xc + 3] == 0x17, 'the DXE volume is not wrapped the way this script expects')
+    fvlen = struct.unpack_from('<Q', raw, fvh + 32)[0]
+    p = old_end
+    while delta and p + 24 <= fvh + fvlen and raw[p:p + 16] != b'\xff' * 16:
+        size = u24(raw, p + 20)
+        need(size >= 24, 'bad file size behind LogoDxe')
+        align_bits = (raw[p + 19] >> 3) & 7
+        need(align_bits == 0 or delta % (1 << (4 + align_bits * 2)) == 0, 'a file behind LogoDxe needs an alignment the shift would break')
+        p = (p + size + 7) & ~7
+    nraw = bytearray(raw[:lo]) + blob + bytearray(raw[old_end:])
+
+    # the volume header: length, block map, checksum; the section that wraps it
+    chk = bytearray(raw)
+    old_ck = u16(chk, fvh + 50)
+    fv_header_checksum(chk, fvh)
+    need(u16(chk, fvh + 50) == old_ck, 'the volume header checksum method does not reproduce the stock value')
+    need(u32(nraw, fvh + 60) == 0x40 and u32(nraw, fvh + 56) * 0x40 == fvlen, 'unexpected volume block map')
+    need(u24(nraw, 0xc) == 4 + fvlen, 'unexpected size of the section around the volume')
+    struct.pack_into('<Q', nraw, fvh + 32, fvlen + delta)
+    struct.pack_into('<I', nraw, fvh + 56, u32(nraw, fvh + 56) + delta // 0x40)
+    fv_header_checksum(nraw, fvh)
+    nraw[0xc:0xf] = (4 + fvlen + delta).to_bytes(3, 'little')
+    return nraw
+
+
+# ---------------------------------------------------------------- build
+def recompress(fd, o, osize, dataoff, lzhdr, raw):
+    """The flash image with the (modified) DXE volume `raw` compressed back into its place."""
+    props = lzhdr[0]
+    lc, lp, pb = props % 9, (props // 9) % 5, props // 45
+    dict_size = max(struct.unpack_from('<I', lzhdr, 1)[0], 1 << 16)
+    comp = bytearray(lzma.compress(bytes(raw), format=lzma.FORMAT_ALONE, filters=[
+        {'id': lzma.FILTER_LZMA1, 'preset': 9 | lzma.PRESET_EXTREME, 'dict_size': dict_size, 'lc': lc, 'lp': lp, 'pb': pb}]))
+    comp[5:13] = struct.pack('<Q', len(raw))      # EDK2's decoder reads the real size from here; Python writes "unknown"
+    nsec = dataoff + len(comp)
+    nffs = 24 + nsec
+    need(nsec < 0xffffff, 'compressed volume too large')
+    need(o + nffs <= len(fd), 'compressed volume no longer fits in the image')
+    if nffs > osize:
+        need(all(b == 0xff for b in fd[o + osize:o + nffs]), 'no free space behind the compressed volume')
+    new = bytearray(fd[o:o + 24 + dataoff]) + comp
+    new[24:27] = nsec.to_bytes(3, 'little')
+    refresh_ffs(new, 0, nffs)
+    out = bytearray(fd)
+    out[o:o + nffs] = new
+    if nffs < osize:
+        out[o + nffs:o + osize] = b'\xff' * (osize - nffs)
+    need(len(out) == len(fd), 'internal error: size changed')
+    return out
+
+
+def build(fd, png):
+    o, osize, sec, ssz, dataoff, lzhdr, raw = decompress_outer(fd)
+    img = locate_image(raw)
+    slot = (img['w'], img['h'])
+    im = load_picture(png)
+    distinct = len(set(im.getdata()))
+
+    # truecolor if the picture has more colours than the palette, is not the size of the logo slot, or the firmware has a truecolor logo already. Otherwise the palette holds it exactly.
+    want_true = img['kind'] == 24 or distinct > img.get('ncolors', 256) or im.size != slot
+    new_raw = None
+    if want_true:
+        try:
+            new_raw = apply_truecolor(raw, im.size[0], im.size[1], to_bgr(im))
+            how = 'truecolor'
+        except Unsupported as e:
+            if img['kind'] != 8:
+                raise
+            sys.stderr.write('gpu_firmware_logo: warning: truecolor not possible with this firmware (%s), using the 8-bit palette\n' % e)
+            if im.size != slot:
+                im = im.resize(slot, Image.LANCZOS)
+    if new_raw is None:
+        pixels, rgb = to_palette(im, img['ncolors'])
+        new_raw = apply_palette(bytearray(raw), img, pixels, rgb)
+        how = 'palette'
+
+    out = recompress(fd, o, osize, dataoff, lzhdr, new_raw)
+
+    # prove it: decode our own output again and compare the volume and the picture
+    _, _, _, _, _, _, raw2 = decompress_outer(out)
+    img2 = locate_image(raw2)
+    need(raw2 == new_raw, 'verification of the patched image failed (volume differs)')
+    if how == 'truecolor':
+        need(img2['kind'] == 24 and (img2['w'], img2['h']) == im.size
+             and bytes(raw2[img2['pix']:img2['pix'] + im.size[0] * im.size[1] * 3]) == to_bgr(im), 'verification of the truecolor image failed')
+    else:
+        nc = img2['ncolors']
+        need(img2['kind'] == 8 and bytes(raw2[img2['pix']:img2['pix'] + slot[0] * slot[1]]) == pixels
+             and bytes(raw2[img2['pal']:img2['pal'] + nc * 3]) == b''.join(bytes((rgb[i * 3 + 2], rgb[i * 3 + 1], rgb[i * 3])) for i in range(nc)),
+             'verification of the palette image failed')
+    return bytes(out)
+
+
+def same_file(a, b):
+    """True if both paths name the same file (same path, symlink, or hard link). A path that does not exist yet is never the same."""
+    try:
+        return os.path.samefile(a, b)
+    except OSError:
+        return os.path.realpath(a) == os.path.realpath(b)
+
+
+def write_output(path, data):
+    """Write the new firmware straight to `path` (no temporary file, no rename). If the write fails the partial file is deleted."""
+    try:
+        with open(path, 'wb') as f:
+            f.write(data)
+            f.flush()
+            os.fsync(f.fileno())
+        os.chmod(path, 0o644)
+    except BaseException:
+        try:
+            os.unlink(path)
+        except OSError:
+            pass
+        raise
+
+
+def main(argv):
+    if len(argv) != 4:
+        sys.stderr.write('usage: gpu_firmware_logo STOCK_FIRMWARE OUTPUT_FIRMWARE LOGO.png\n')
+        return 2
+    src, out, png = argv[1:]
+    # the stock firmware is only ever read: refuse any output that is (a link to) the same file, before anything is opened for writing
+    if same_file(src, out):
+        sys.stderr.write('gpu_firmware_logo: the output is the same file as the stock firmware, which is never modified\n')
+        return 2
+    try:
+        fd = open(src, 'rb').read()
+    except OSError as e:
+        sys.stderr.write('gpu_firmware_logo: cannot read %s: %s\n' % (src, e))
+        return 2
+    try:
+        result = build(fd, png)
+    except BadImage as e:
+        sys.stderr.write('gpu_firmware_logo: %s\n' % e)
+        return 2
+    except Unsupported as e:
+        sys.stderr.write('gpu_firmware_logo: unsupported firmware (%s); keep using the stock file\n' % e)
+        return 3
+    try:
+        write_output(out, result)
+    except OSError as e:
+        sys.stderr.write('gpu_firmware_logo: cannot write %s: %s\n' % (out, e))
+        return 1
+    return 0
+
+
+sys.exit(main(['gpu_firmware_logo'] + sys.argv[1:]))
+PYTHON
+}
+
+gpu_build_firmware() { #Input: hash of the inputs. Make a copy of the QEMU firmware with the BVM logo, in $vmdir/gpu/firmware. The original is not changed.
+  mkdir -p "$vmdir/gpu/firmware" || error "gpu_build_firmware: failed to create $vmdir/gpu/firmware"
+  if ! gpu_firmware_logo /usr/share/qemu-efi-aarch64/QEMU_EFI.fd "$vmdir/gpu/firmware/QEMU_EFI.fd" "$DIRECTORY/resources/graphics/firmware-logo.png" ;then
+    #only the firmware of Debian 12 and 13 has the layout that the tool understands. The VM works the same without the logo.
+    warning "Could not put the BVM logo into the firmware. Using the original firmware."
+    cp -f /usr/share/qemu-efi-aarch64/QEMU_EFI.fd "$vmdir/gpu/firmware/QEMU_EFI.fd" || error "gpu_build_firmware: failed to copy the firmware"
+  fi
+}
+
+gpu_policy() { #Input: add or remove. Add or remove our startup script (guest-autologon.cmd) in the local group policy of the mounted Windows disk, next to any scripts that Windows already has.
+  #Windows runs a computer startup script as SYSTEM at every boot, with or without a logon, so it can repair a broken automatic login at the login screen. The file names are not always capitalized the same.
+  local policy="$(sudo find "$mountpoint/Windows/System32" -maxdepth 1 -iname GroupPolicy | head -n1)"
+  [ -z "$policy" ] && policy="$mountpoint/Windows/System32/GroupPolicy"
+  local scripts_ini="$(sudo find "$policy/Machine/Scripts" -maxdepth 1 -iname scripts.ini 2>/dev/null | head -n1)"
+  [ -z "$scripts_ini" ] && scripts_ini="$policy/Machine/Scripts/scripts.ini"
+  local gpt_ini="$(sudo find "$policy" -maxdepth 1 -iname gpt.ini 2>/dev/null | head -n1)"
+  [ -z "$gpt_ini" ] && gpt_ini="$policy/gpt.ini"
+  
+  local work="$vmdir/gpu/policy"
+  rm -rf "$work"
+  mkdir -p "$work" || error "gpu_policy: failed to create $work"
+  local existing_scripts=''
+  local existing_gpt=''
+  if sudo test -f "$scripts_ini" ;then
+    sudo cat "$scripts_ini" > "$work/scripts.old" || error "gpu_policy: failed to read $scripts_ini"
+    existing_scripts="$work/scripts.old"
+  fi
+  if sudo test -f "$gpt_ini" ;then
+    sudo cat "$gpt_ini" > "$work/gpt.old" || error "gpu_policy: failed to read $gpt_ini"
+    existing_gpt="$work/gpt.old"
+  fi
+  local result
+  result="$(python3 -I "$DIRECTORY/resources/gpu-policy.py" "$1" "$existing_gpt" "$existing_scripts" "$work/new")" || error "gpu_policy: failed to prepare the group policy files"
+  
+  if [ "$result" == changed ] || [ "$result" == removed ];then
+    sudo mkdir -p "$policy/Machine/Scripts/Startup" "$policy/Machine/Scripts/Shutdown" "$policy/User" || error "gpu_policy: failed to create the group policy folders"
+    sudo cp -f "$work/new/scripts.ini" "$scripts_ini" || error "gpu_policy: failed to write $scripts_ini"
+    sudo cp -f "$work/new/gpt.ini" "$gpt_ini" || error "gpu_policy: failed to write $gpt_ini"
+  elif [ "$result" == empty ];then
+    #nothing else was in the policy: no startup script is left
+    sudo rm -f "$scripts_ini"
+  fi
+  rm -rf "$work"
+}
+
+gpu_stage_guest() { #Input: the folder to make, the id of this injection. Collect the guest setup and everything it installs in a folder that is laid out like C:\bvm in Windows. The folder is deleted first.
+  #Used for an existing VM (gpu_inject_guest copies it into the disk) and for a new one (it goes on the unattended ISO, where firstlogin.ps1 copies it).
+  local stage="$1"
+  rm -rf "$stage"
+  mkdir -p "$stage/payload" || error "gpu_stage_guest: failed to create $stage"
+  #the setup is a batch file, and cmd needs Windows line endings to run it properly
+  sed 's/$/\r/' "$DIRECTORY/resources/guest-gpu-setup.cmd" > "$stage/guest-setup.cmd" || error "gpu_stage_guest: failed to prepare guest-gpu-setup.cmd"
+  sed 's/$/\r/' "$DIRECTORY/resources/guest-gpu-autologon.cmd" > "$stage/guest-autologon.cmd" || error "gpu_stage_guest: failed to prepare guest-gpu-autologon.cmd"
+  cp -r "$vmdir/gpu/drivers/viogpu3d" "$stage/payload/viogpu3d" || error "gpu_stage_guest: failed to copy the GPU driver"
+  cp -r "$vmdir/gpu/spice-agent" "$stage/payload/vdagent-arm64" || error "gpu_stage_guest: failed to copy the SPICE agent"
+  if [ -d "$vmdir/unattended/vioserial" ];then
+    cp -r "$vmdir/unattended/vioserial" "$stage/payload/vioserial-arm64" || error "gpu_stage_guest: failed to copy the serial driver"
+  else
+    #Windows already installed it during setup, and the guest script only installs it if it is missing
+    warning "$vmdir/unattended/vioserial does not exist, so the serial driver is not included."
+  fi
+  #inject-id.txt tells the script which injection it belongs to. The login is for repairing the automatic login, and is deleted by the script.
+  echo "$2" > "$stage/inject-id.txt"
+  printf '%s\r\n%s\r\n' "$vm_username" "$vm_password" > "$stage/credentials.txt"
+}
+
+gpu_inject_guest() { #Input: hash of the inputs. Copy the guest setup into the Windows disk: a batch file and the files it installs (the GPU driver, the SPICE agent).
+  #A launcher in the Startup folder runs it at the next logon, in a visible window. It installs everything, restarts if needed, and then deletes itself. The VM must be shut down.
+  process_exists "$(cat "$vmdir/qemu.pid" 2>/dev/null)" && error "gpu_inject_guest: the VM is running. Shut it down first."
+  
+  #collect everything in a folder first, laid out like C:\bvm in Windows
+  local stage="$vmdir/gpu/guest"
+  gpu_stage_guest "$stage" "$1"
+  #the launcher for the Startup folder runs the setup at the logon, in its own visible window (that window is the progress display). The setup runs from a copy in
+  #C:\Windows\Temp, because it deletes C:\bvm\guest-setup.cmd when it is done and cmd reads a batch file while it runs. Nothing happens if the files are gone already.
+  printf '@echo off\r\nif exist C:\\bvm\\guest-setup.cmd (copy /y C:\\bvm\\guest-setup.cmd C:\\Windows\\Temp\\bvm-setup.cmd >nul & call C:\\Windows\\Temp\\bvm-setup.cmd)\r\n' > "$stage/bvm-guest-setup.cmd"
+  status "Copying the guest setup into disk.qcow2..."
+  mount_qcow2 "$vmdir/disk.qcow2" #will exit right here on error
+  trap "unmount_qcow2 &>/dev/null" EXIT SIGINT
+  local mountpoint="/media/$USER/bvm-mount$rdp_port"
+  [ ! -d "$mountpoint/Windows/System32" ] && error "gpu_inject_guest: there is no Windows installation in disk.qcow2"
+  
+  sudo rm -rf "$mountpoint/bvm/payload" #files of an earlier injection
+  sudo mkdir -p "$mountpoint/bvm" || error "gpu_inject_guest: failed to create C:\\bvm"
+  #the log of earlier injections goes to another file, so that this one only has the runs of this injection (gpu_transition counts them)
+  [ -f "$mountpoint/bvm/setup.log" ] && sudo mv -f "$mountpoint/bvm/setup.log" "$mountpoint/bvm/setup.previous.log"
+  #files of the PowerShell versions of the setup
+  sudo rm -f "$mountpoint/bvm/guest-setup.ps1" "$mountpoint/bvm/guest-progress.ps1" "$mountpoint/bvm/guest-progress.cmd" "$mountpoint/Windows/Temp/bvm-progress.cmd" "$mountpoint/Windows/Temp/bvm-progress.lock"
+  sudo cp -r "$stage/payload" "$stage/guest-setup.cmd" "$stage/guest-autologon.cmd" "$stage/inject-id.txt" "$stage/credentials.txt" "$mountpoint/bvm/" || error "gpu_inject_guest: failed to copy the files to C:\\bvm"
+  sudo rm -f "$mountpoint/bvm/autologon.log"
+  
+  #the setup itself starts at the logon, so a broken automatic login would never start it. This second script runs without one, see gpu_policy.
+  gpu_policy add
+  
+  #the launcher in the Startup folder for all users
+  local startup="$(sudo find "$mountpoint/ProgramData/Microsoft/Windows/Start Menu/Programs" -maxdepth 1 -iname startup 2>/dev/null | head -n1)"
+  if [ -z "$startup" ];then
+    startup="$mountpoint/ProgramData/Microsoft/Windows/Start Menu/Programs/StartUp"
+    sudo mkdir -p "$startup" || error "gpu_inject_guest: failed to create $startup"
+  fi
+  sudo cp -f "$stage/bvm-guest-setup.cmd" "$startup/bvm-guest-setup.cmd" || error "gpu_inject_guest: failed to write the startup folder launcher"
+  
+  sync
+  unmount_qcow2 || error "gpu_inject_guest: failed to unmount disk.qcow2"
+  trap - EXIT SIGINT
+  rm -rf "$stage" #it has the password of the VM
+  echo injected > "$vmdir/gpu/state"
+}
+
+gpu_setup() { #download, patch and compile everything GPU mode needs. Steps that are already done are skipped, so this can be run again after a failure.
+  #a step runs again when its sources or patches changed. Later steps list the hash of what they use from earlier ones. Windows is not touched, see gpu_firstboot.
+  gpu_preflight
+  
+  local patches="$DIRECTORY/resources/gpu-patches"
+  local mesa_hash="$(gpu_hash "$gpu_mesa_commit" "$patches/bvm-mesa.patch")"
+  local dxvk_hash="$(gpu_hash "$gpu_dxvk_commit" "$patches/bvm-dxvk.patch" "$patches/bvm-dxbc-spirv.patch")"
+  local virgl_hash="$(gpu_hash "$gpu_virglrenderer_commit" "$gpu_neptune_commit" "$patches/bvm-virgl.patch" "$patches/bvm-virgl-protocol.patch" "$dxvk_hash")"
+  local qemu_hash="$(gpu_hash "$gpu_qemu_commit" "$patches/bvm-qemu.patch" "$virgl_hash")"
+  local driver_hash="$(gpu_hash "$gpu_triton_url" "$gpu_triton_sha256")"
+  local spice_hash="$(gpu_hash "$gpu_spice_url" "$gpu_spice_sha256")"
+  local firmware_hash="$(gpu_hash /usr/share/qemu-efi-aarch64/QEMU_EFI.fd "$(declare -f gpu_firmware_logo)" "$DIRECTORY/resources/graphics/firmware-logo.png")"
+  
+  #compiling is what takes long. It only happens when Mesa or QEMU (and with it everything that QEMU uses) is not built yet, or changed
+  if [ "$(cat "$vmdir/gpu/done/mesa" 2>/dev/null)" != "$mesa_hash" ] || [ "$(cat "$vmdir/gpu/done/qemu" 2>/dev/null)" != "$qemu_hash" ];then
+    warning "GPU mode compiles Mesa, DXVK, virglrenderer and QEMU now. This takes 1 to 2 hours, and uses about 15 GB of disk space. Press Ctrl+C to stop; running this again continues where it left off."
+  fi
+  
+  gpu_run_step build-dependencies "$(gpu_hash "$gpu_build_packages")" gpu_install_build_dependencies
+  gpu_run_step driver "$driver_hash" gpu_get_driver
+  gpu_run_step spice-agent "$spice_hash" gpu_get_spice_agent
+  gpu_run_step mesa "$mesa_hash" gpu_build_mesa
+  gpu_run_step dxvk "$dxvk_hash" gpu_build_dxvk
+  gpu_run_step virglrenderer "$virgl_hash" gpu_build_virglrenderer
+  gpu_run_step qemu "$qemu_hash" gpu_build_qemu
+  gpu_run_step firmware "$firmware_hash" gpu_build_firmware
+  
+  #the sources and build folders (2 GB and more) are only needed for compiling, and everything that boot-gpu and gpu-firstboot use is installed elsewhere in $vmdir/gpu.
+  #If a pinned commit or a patch changes, the step that needs them downloads them again.
+  if [ -d "$vmdir/gpu/src" ];then
+    status "Deleting the sources that are not needed any more ($(du -sh "$vmdir/gpu/src" | awk '{print $1}'))."
+    rm -rf "$vmdir/gpu/src" || warning "failed to delete $vmdir/gpu/src"
+  fi
+  
+  status_green "GPU mode is built in $vmdir/gpu. Next, prepare Windows for it: $0 gpu-firstboot $vmdir (a new VM that was installed with this version does not need that)"
+}
+
+gpu_firstboot() { #prepare Windows for GPU mode: copy the guest setup into it, boot it once with a plain display so it installs everything, and shut it down again.
+  #needs what gpu_setup built. Always runs the whole thing again (injection, boot, shutdown), however often it was run before. vmdir must be set.
+  [ -z "$vmdir" ] && error "gpu_firstboot: vmdir must be set"
+  if [ ! -f "$vmdir/disk.qcow2" ] || [ "$(cat "$vmdir/gui-steps-complete" 2>/dev/null || echo 0)" -lt 5 ];then
+    error "GPU mode needs a VM with Windows installed. Finish the steps of the normal setup first (Run: $0 firstboot $vmdir)."
+  elif [ -z "$DISPLAY" ] && [ -z "$WAYLAND_DISPLAY" ];then
+    error "BVM needs a desktop environment to run $mode"
+  elif [ ! -f "$vmdir/gpu/done/qemu" ] || [ ! -f "$vmdir/gpu/done/firmware" ] || [ ! -f "$vmdir/gpu/done/driver" ] || [ ! -f "$vmdir/gpu/done/spice-agent" ];then
+    error "GPU mode is not built yet. Run: $0 gpu-setup $vmdir"
+  elif [ "$(cat "$vmdir/gpu/location" 2>/dev/null)" != "$vmdir/gpu" ];then
+    error "The VM folder was moved or renamed since GPU mode was built. Run: $0 gpu-setup $vmdir"
+  fi
+  process_exists "$(cat "$vmdir/qemu.pid" 2>/dev/null)" && error "The VM is running. Shut it down first."
+  
+  #copy the guest setup into Windows. This is always done, however often this command was run before (whoever runs it expects Windows to boot and run the scripts again),
+  #so the marker of an earlier run is removed first. The hash is what the guest setup calls the id of this injection. The login is part of it, as the setup repairs the automatic login with it.
+  rm -f "$vmdir/gpu/done/guest"
+  local driver_hash="$(gpu_hash "$gpu_triton_url" "$gpu_triton_sha256")"
+  local spice_hash="$(gpu_hash "$gpu_spice_url" "$gpu_spice_sha256")"
+  local guest_hash="$(gpu_hash "$DIRECTORY/resources/guest-gpu-setup.cmd" "$DIRECTORY/resources/guest-gpu-autologon.cmd" "$DIRECTORY/resources/gpu-policy.py" "$driver_hash" "$spice_hash" "$vm_username" "$vm_password")"
+  gpu_run_step guest "$guest_hash" gpu_inject_guest
+  
+  #then let Windows run it, every time
+  gpu_transition
+  status_green "Windows is prepared for GPU mode and has shut down. Start it with: $0 boot-gpu $vmdir"
+}
+
+gpu_transition() { #boot Windows once with a plain display, so the guest setup that gpu_inject_guest copied into it can install the GPU driver. Returns when that is done.
+  #the GPU device cannot be used before its driver is installed. Windows restarts by itself during the setup, and shuts down when it is finished. vmdir must be set.
+  [ -z "$vmdir" ] && error "gpu_transition: vmdir must be set"
+  local mountpoint="/media/$USER/bvm-mount$rdp_port"
+  
+  #ask the guest setup to shut Windows down when it is done, but only during this boot (a flag file), and count the runs that its log has now
+  status "Preparing disk.qcow2 for the first GPU boot..."
+  mount_qcow2 "$vmdir/disk.qcow2" #will exit right here on error
+  trap "unmount_qcow2 &>/dev/null" EXIT SIGINT
+  [ ! -d "$mountpoint/bvm" ] && error "gpu_transition: C:\\bvm does not exist in disk.qcow2. Run: $0 gpu-setup $vmdir"
+  echo "shut down when the guest setup is done" | sudo tee "$mountpoint/bvm/shutdown-when-done.flag" >/dev/null || error "gpu_transition: failed to write the flag file"
+  local runs_before="$(sudo cat "$mountpoint/bvm/setup.log" 2>/dev/null | grep -c 'guest-setup start')"
+  unmount_qcow2 || error "gpu_transition: failed to unmount disk.qcow2"
+  trap - EXIT SIGINT
+  
+  status "Starting Windows with a plain display, so it can install the GPU driver. It shuts down by itself when it is done, then GPU mode starts."
+  status "Once Windows has logged in, a window opens inside it that shows the setup, and stays open until Windows shuts down."
+  
+  #this terminal would be silent while Windows works, so say now and then that it is still going
+  (
+    local started=$SECONDS
+    while true;do
+      sleep 30
+      status "Still waiting for Windows' setup: $(((SECONDS-started)/60)) min $(((SECONDS-started)%60)) s so far. The setup window is inside the Windows window."
+      #the setup is started by the logon, so a Windows that stays at its login screen (the automatic login is broken) waits for ever. Say what to do.
+      if [ $((SECONDS-started)) -ge 240 ];then
+        status "Nothing seems to happen? If Windows shows its login screen, log in yourself as $vm_username (the password is in $vmdir/bvm-config): the setup starts at the logon and repairs the automatic login. If its window is red, close this QEMU window: the log says why."
+      fi
+    done
+  ) &
+  local ticker=$!
+  trap "kill $ticker 2>/dev/null" EXIT SIGINT
+  (
+    export LD_LIBRARY_PATH="$(gpu_sysroot_ldpath)$LD_LIBRARY_PATH"
+    rm -f "$vmdir/qemu.pid"
+    "$vmdir/gpu/sysroot/bin/qemu-system-aarch64" -M virt,accel=kvm -cpu host -m ${vm_mem}G -smp "$(command nproc)" \
+      -name BVM,process=bvm \
+      -pidfile "$vmdir/qemu.pid" \
+      -device ramfb -vga none -display gtk,gl=off,grab-on-hover=on \
+      -device qemu-xhci \
+      -device usb-kbd \
+      -device usb-tablet \
+      -monitor unix:"$vmdir/qemu.sock",server,nowait \
+      -rtc base=localtime,clock=host,driftfix=none \
+      -device virtio-rng-pci,rng=rng0 -object rng-random,id=rng0,filename=/dev/urandom \
+      -netdev user,id=nic -device virtio-net-pci,netdev=nic \
+      -bios "$vmdir/gpu/firmware/QEMU_EFI.fd" \
+      -drive file="$vmdir/disk.qcow2",if=virtio,discard=unmap,aio=threads,cache=none
+  )
+  local qemu_exit_code=$?
+  kill $ticker 2>/dev/null
+  trap - EXIT SIGINT
+  status "QEMU closed (exit code $qemu_exit_code)."
+  if [ $qemu_exit_code != 0 ];then
+    (exit $qemu_exit_code) ; qemu_exitcode_analyzer
+  fi
+  
+  #Windows is shut down now. Its setup writes a log in C:\bvm, which shows if it was successful (this also works if the window was closed by hand after it finished)
+  status "Checking the guest setup log (mounting disk.qcow2)..."
+  mount_qcow2 "$vmdir/disk.qcow2"
+  trap "unmount_qcow2 &>/dev/null" EXIT SIGINT
+  local log="$(sudo cat "$mountpoint/bvm/setup.log" 2>/dev/null)"
+  sudo rm -f "$mountpoint/bvm/shutdown-when-done.flag"
+  
+  #the log keeps the runs of earlier setups. It needs a new run, and "all steps passed" after the start of the last one.
+  local runs_after="$(echo "$log" | grep -c 'guest-setup start')"
+  local finished=false
+  if [ "$runs_after" -gt "$runs_before" ] && echo "$log" | awk '/guest-setup start/ {started=NR} /all steps passed/ {passed=NR} END {exit !(passed > started)}' ;then
+    finished=true
+    #the setup removed itself. What stays is the copy that ran from C:\Windows\Temp (it deletes itself too, unless Windows shut down first), and its lock file
+    sudo rm -f "$mountpoint/Windows/Temp/bvm-setup.cmd" "$mountpoint/Windows/Temp/bvm-setup.lock"
+    sudo find "$mountpoint/ProgramData/Microsoft/Windows/Start Menu/Programs" -maxdepth 2 -iname bvm-guest-setup.cmd -delete
+  fi
+  #the autologon repair only matters while a setup is pending. The log of what it did (autologon.log) stays.
+  if [ "$finished" == true ];then
+    gpu_policy remove
+    sudo rm -f "$mountpoint/bvm/guest-autologon.cmd"
+  fi
+  unmount_qcow2 || error "gpu_transition: failed to unmount disk.qcow2"
+  trap - EXIT SIGINT
+  
+  status "Last lines of the guest setup log ($runs_before runs before, $runs_after now):"
+  echo "$log" | tail -n 10 | sed 's/^/  /' 1>&2
+  if [ "$runs_after" -le "$runs_before" ];then
+    error "Windows did not run the guest setup at all (the log has no new run). Its startup script, a local group policy that gpu-setup put into Windows, did not start. To inject it again, delete $vmdir/gpu/done/guest and run: $0 gpu-setup $vmdir\nIf this keeps happening, tell the BVM developers which Windows edition the VM has."
+  elif [ "$finished" != true ];then
+    error "The guest setup did not finish. See the log lines above (the whole log is C:\\bvm\\setup.log in Windows). Run this again to continue."
+  fi
+  echo transitioned > "$vmdir/gpu/state"
+  status_green "Windows has installed what GPU mode needs."
+}
 
 #Ensure /usr/sbin is in PATH to fix https://github.com/Botspot/bvm/issues/180
 if [[ ":$PATH:" != *":/usr/sbin:"* ]]; then
@@ -904,6 +2006,13 @@ fi
 [ -z "$disksize" ] && disksize=40
 [ -z "$free_ram_goal" ] && free_ram_goal=100
 [ -z "$fullscreen" ] && fullscreen=false
+[ -z "${shared_folder+x}" ] && shared_folder="$HOME" #the folder shared with Windows. An empty shared_folder in the config file shares nothing.
+[ -z "$tpm" ] && tpm=false
+[ -z "$guest_hz" ] && guest_hz=30 #GPU mode: the refresh rate Windows thinks it has
+if ! [[ "$guest_hz" =~ ^[0-9]+$ ]] || [ "$guest_hz" -lt 1 ] || [ "$guest_hz" -gt 240 ];then
+  warning "guest_hz in the config file must be a number from 1 to 240, not '$guest_hz'. Using 30."
+  guest_hz=30
+fi
 if [ -z "$vm_mem" ];then
   #choose RAM to allocate to VM - 1GB less than total RAM
   vm_mem="$(($(awk '/MemTotal/ {print $2}' /proc/meminfo)/1024/1024))"
@@ -978,7 +2087,16 @@ case "$mode" in
     echo -e "BVM HELP:   --------------------------------------------------------------------
 \e[96mAll primary modes: new-vm, download, prepare, firstboot, boot, connect, mount, expand\e[0m
 You generally want to run the modes in that order.
-Additional modes: help, list-languages, boot-nodisplay, boot-ramfb, boot-gtk, connect-freerdp, connect-remmina
+Additional modes: help, list-languages, boot-nodisplay, boot-ramfb, boot-gtk, connect-remmina
+GPU mode (experimental, in development): gpu-setup, gpu-firstboot, boot-gpu
+ First run \e[96m$0 gpu-setup $HOME/win11\e[0m: it downloads and compiles everything (1-2 hours, 15 GB of disk space while it works), then deletes the sources again.
+ Then \e[96m$0 gpu-firstboot $HOME/win11\e[0m prepares Windows: one boot with a plain display, where Windows installs the GPU driver, the clipboard agent and the shared
+ folder, and shuts down by itself. A VM that was installed with this version of BVM did that during its install, and can skip this. You can run it again at any time: it
+ always boots Windows and runs the setup again. \e[96m$0 boot-gpu $HOME/win11\e[0m starts Windows with the GPU. The refresh rate (guest_hz) and the shared folder
+ are settings in the config file of the VM.
+ The gpu folder inside the VM folder is only for GPU mode and always safe to delete: gpu-setup builds it again. For debugging, this one line inside Windows (a prompt, with GPU mode running so that Z: is your
+ shared folder) undoes what gpu-firstboot did there, so that it can be run again from a clean state:
+ net use Z: \\\\10.0.2.4\\qemu & copy /y Z:\\bvm\\resources\\guest-gpu-revert.ps1 %TEMP% && powershell -ExecutionPolicy Bypass -File %TEMP%\\guest-gpu-revert.ps1 -Shutdown
 
 To get a fresh VM up and running, use a sequence like this:
 \e[96m$0 new-vm $HOME/win11\e[0m
@@ -1009,7 +2127,15 @@ To get a fresh VM up and running, use a sequence like this:
   list-languages)
     list_download_languages | sed 's/.*://g'
     ;;
-    
+  
+  gpu-setup) #download, patch and compile everything GPU mode needs. Takes hours the first time. Windows is not touched.
+    gpu_setup
+    ;;
+  
+  gpu-firstboot) #prepare Windows for GPU mode: it installs the GPU driver in a boot with a plain display, then shuts down
+    gpu_firstboot
+    ;;
+  
   gui)
     
     [ -z "$vmdir" ] && vmdir=$HOME/win11
@@ -1093,8 +2219,10 @@ To get a fresh VM up and running, use a sequence like this:
             Direct*)
               run_in_terminal "export fullscreen=$fullscreen ; ${DIRECTORY}/bvm boot-gtk '$vmdir' ; step_complete"
               ;;
-            FreeRDP*)
-              run_in_terminal "export fullscreen=$fullscreen ; ${DIRECTORY}/bvm boot-nodisplay '$vmdir' & pid=\$! ; while [ -f /proc/\$pid/status ] && [ ! -f /proc/\$(cat '$vmdir/qemu.pid' 2>/dev/null)/status ];do sleep 1 ;done; nosplash=true ${DIRECTORY}/bvm connect-freerdp '$vmdir' ; step_complete"
+            GPU*)
+              #gpu-setup builds everything (and does next to nothing when it is built already). Windows is prepared for GPU mode first if that has not happened yet
+              #(gpu-firstboot). If it has, that is skipped entirely.
+              run_in_terminal "export fullscreen=$fullscreen ; ${DIRECTORY}/bvm gpu-setup '$vmdir' && { [ \"\$(cat '$vmdir/gpu/state' 2>/dev/null)\" == transitioned ] || ${DIRECTORY}/bvm gpu-firstboot '$vmdir' ; } && ${DIRECTORY}/bvm boot-gpu '$vmdir' ; step_complete"
               ;;
             Remmina*)
               run_in_terminal "export fullscreen=$fullscreen ; ${DIRECTORY}/bvm boot-nodisplay '$vmdir' & pid=\$! ; while [ -f /proc/\$pid/status ] && [ ! -f /proc/\$(cat '$vmdir/qemu.pid' 2>/dev/null)/status ];do sleep 1 ;done; nosplash=true ${DIRECTORY}/bvm connect-remmina '$vmdir' ; step_complete"
@@ -1201,11 +2329,11 @@ To get a fresh VM up and running, use a sequence like this:
       --field="<b>Prepare for installation</b>!${DIRECTORY}/resources/graphics/4.png!Bundle up driver files and get ready for first boot":FBTN "$initial_button4" \
       --field="<b>Install Windows 11</b>!${DIRECTORY}/resources/graphics/5.png!Boot the VM for the first time to install Windows":FBTN "$initial_button5" \
       --field="<b>Run Windows 11</b>!${DIRECTORY}/resources/graphics/6.png!Boot the VM normally":FBTN "$initial_button6" \
-      --field="Viewing mode:":CB "Direct RAMFB (debugging)!Direct!Direct fullscreen!FreeRDP!FreeRDP fullscreen!^Remmina!Remmina fullscreen" \
+      --field="Viewing mode:":CB "Direct RAMFB (debugging)!Direct!Direct fullscreen!^Remmina!Remmina fullscreen!GPU (experimental)!GPU fullscreen" \
       --field="Mount disk.qcow2!!Browse the full C: drive of the VM to add/remove files":FBTN "$initial_mount_button" \
       --field="Expand disk.qcow2!!Increase the size of the storage available to the VM":FBTN "$initial_expand_button" \
       --field="USB passthrough!!Give the VM direct access to specific USB devices":FBTN "$initial_usbsetup_button"
-
+    
     ;;
   new-vm)
     #initializes a new vmdir
@@ -1303,6 +2431,16 @@ To get a fresh VM up and running, use a sequence like this:
     
     #no need for virtio iso anymore, now that we have extracted arm64-compatible stuff
     rm -f "${vmdir}/virtio-win.iso"
+    
+    #the guest setup (shared folder, clipboard sync, automatic login, power settings, GPU driver) runs at the end of the first boot, from the folder bvm of unattended.iso. It needs the two
+    #downloads of GPU mode. Without them (offline, or a download failed) the install goes on without it, and the command gpu-firstboot does the same later.
+    status "Downloading the GPU driver and the clipboard agent..."
+    rm -rf "$vmdir/unattended/bvm"
+    if (gpu_run_step driver "$(gpu_hash "$gpu_triton_url" "$gpu_triton_sha256")" gpu_get_driver && gpu_run_step spice-agent "$(gpu_hash "$gpu_spice_url" "$gpu_spice_sha256")" gpu_get_spice_agent) ;then
+      gpu_stage_guest "$vmdir/unattended/bvm" firstboot
+    else
+      warning "The GPU driver or the clipboard agent could not be downloaded. Windows is installed without them. Later, run: $0 gpu-firstboot $vmdir"
+    fi
     
     #the next step will convert unattended/ folder to unattended.iso
     
@@ -1410,8 +2548,16 @@ To get a fresh VM up and running, use a sequence like this:
     fi
     
     remove_microsoft_defender "$mountpoint" || exit 1
-    #if debloat is disabled, all this does is mount the disk.qcow2 to make sure it seems complete
-    remove_UCPD_from_mountpoint "$mountpoint"
+    #the guest setup ran at the end of this first boot if the drivers could be downloaded (see the unattended/bvm folder). If it passed, Windows is already prepared for GPU mode:
+    #gpu-firstboot is only for VMs that were installed without it. The GPU mode of the host side still has to be built with gpu-setup.
+    guest_log="$(sudo cat "$mountpoint/bvm/setup.log" 2>/dev/null)"
+    if echo "$guest_log" | awk '/guest-setup start/ {started=NR} /all steps passed/ {passed=NR} END {exit !(passed > started)}' ;then
+      sudo rm -f "$mountpoint/Windows/Temp/bvm-setup.cmd" "$mountpoint/Windows/Temp/bvm-setup.lock"
+      mkdir -p "$vmdir/gpu" && echo transitioned > "$vmdir/gpu/state"
+      status_green "The guest setup passed: Windows is ready for GPU mode (build the rest with: $0 gpu-setup $vmdir)"
+    elif [ ! -z "$guest_log" ];then
+      warning "The guest setup did not finish cleanly. Its log: C:\\bvm\\setup.log inside Windows. Run '$0 gpu-firstboot $vmdir' to try it again."
+    fi
     
     unmount_qcow2 || exit 1
     
@@ -1428,7 +2574,7 @@ To get a fresh VM up and running, use a sequence like this:
     
     #workaround for users who experienced microsoft defender removal failure on firstboot (https://github.com/Botspot/bvm/issues/19)
     if [ "$(cat "$vmdir/gui-steps-complete")" == 4 ];then #this will be 4 because firstboot failed after succeeding
-      (mount_qcow2 "$vmdir/disk.qcow2" && remove_microsoft_defender "/media/$USER/bvm-mount$rdp_port" && remove_UCPD_from_mountpoint "$mountpoint" && echo 5 > "$vmdir/gui-steps-complete")
+      (mount_qcow2 "$vmdir/disk.qcow2" && remove_microsoft_defender "/media/$USER/bvm-mount$rdp_port" && echo 5> "$vmdir/gui-steps-complete")
       unmount_qcow2
     fi
     
@@ -1441,7 +2587,33 @@ To get a fresh VM up and running, use a sequence like this:
       error "BVM needs a desktop environment to run $mode"
     fi
     
-    #choose display mode (ramfb, gtk, none)
+    if [ "$mode" == boot-gpu ];then
+      [ -z "$WAYLAND_DISPLAY" ] && warning "GPU mode has only been tested on a Wayland desktop."
+      if [ ! -x "$vmdir/gpu/sysroot/bin/qemu-system-aarch64" ] || [ ! -f "$vmdir/gpu/firmware/QEMU_EFI.fd" ];then
+        error "GPU mode is not built yet. Run: $0 gpu-setup $vmdir"
+      elif [ "$(cat "$vmdir/gpu/location" 2>/dev/null)" != "$vmdir/gpu" ];then
+        error "The VM folder was moved or renamed since GPU mode was built. Run: $0 gpu-setup $vmdir"
+      fi
+      
+      #Windows has to be prepared first (it installs the GPU driver), which is a separate command. The state is also what a future firstboot would write.
+      if [ "$(cat "$vmdir/gpu/state" 2>/dev/null)" != transitioned ];then
+        error "Windows is not prepared for GPU mode yet. Run: $0 gpu-firstboot $vmdir"
+      fi
+    fi
+    
+    #everything that is different in GPU mode is set below, in the boot-gpu part of the display modes
+    qemu_command=(qemu-system-aarch64)
+    bios_file=/usr/share/qemu-efi-aarch64/QEMU_EFI.fd
+    clipboard_flags=()
+    audio_latency=''
+    
+    #every mode with a display window of its own (all except boot-nodisplay, which has the RDP connection) shares the clipboard with the SPICE agent in Windows (the guest setup installs it).
+    #mouse=off keeps the pointer on the usb-tablet: the agent's idea of the screen size drifts after a window resize
+    if [ "$mode" != boot-nodisplay ];then
+      clipboard_flags=(-chardev qemu-vdagent,id=vdagent,name=vdagent,clipboard=on,mouse=off -device virtserialport,chardev=vdagent,name=com.redhat.spice.0)
+    fi
+    
+    #choose display mode (ramfb, gtk, none, gpu)
     case "$mode" in
       boot-nodisplay)
         display_flags=(-vga none -device virtio-gpu-pci -display none)
@@ -1451,6 +2623,23 @@ To get a fresh VM up and running, use a sequence like this:
         ;;
       boot-gtk|boot)
         display_flags=(-vga none -device virtio-gpu-pci -display gtk,gl=off,grab-on-hover=on$([ "$fullscreen" == true ] && echo ',full-screen=on'))
+        ;;
+      boot-gpu)
+        #the QEMU, firmware and libraries that gpu-setup made
+        bios_file="$vmdir/gpu/firmware/QEMU_EFI.fd"
+        
+        display_flags=(-vga none -device virtio-gpu-gl-pci,hostmem=1G,blob=true,venus=true,neptune=true -display sdl,gl=on$([ "$fullscreen" == true ] && echo ',full-screen=on'))
+        audio_latency=',out.latency=120000'
+        
+        #run our QEMU with the libraries and settings that only it (and the render server it starts) should see. env keeps them away from everything else.
+        dxvk_folder="$(dirname "$(find "$vmdir/gpu/sysroot" -name libdxvk_d3d11.so | head -n1)")"
+        #NPT_CAPS_SHIM: without it Windows' compositor crashes in a loop on the Pi's GPU
+        #BVM_GUEST_HZ: the refresh rate Windows thinks it has (guest_hz in the config file). The GPU of a Pi cannot keep up with 60, and 30 looks smoother
+        qemu_command=(env LD_LIBRARY_PATH="$(gpu_sysroot_ldpath)$LD_LIBRARY_PATH" \
+          NPT_D3D11_LIBRARY_PATH="$dxvk_folder/libdxvk_d3d11.so" NPT_DXGI_LIBRARY_PATH="$dxvk_folder/libdxvk_dxgi.so" \
+          RENDER_SERVER_EXEC_PATH="$vmdir/gpu/sysroot/usr/local/libexec/virgl_render_server" \
+          VK_DRIVER_FILES="$vmdir/gpu/broadcom_icd.json" NPT_CAPS_SHIM=1 BVM_GUEST_HZ="$guest_hz"${WAYLAND_DISPLAY:+SDL_VIDEODRIVER=wayland} \
+          "$vmdir/gpu/sysroot/bin/qemu-system-aarch64")
         ;;
       *)
         error "Unknown suffix after 'boot': '$mode'"
@@ -1466,14 +2655,14 @@ To get a fresh VM up and running, use a sequence like this:
     if pgrep pipewire >/dev/null && qemu_newer_than 8.1.0 ;then
       #Make QEMU use pipewire output backend, if possible
       debug "Using pipewire audio backend"
-      audio_flags=(-device usb-audio,audiodev=my_audiodev -audiodev "pipewire,id=my_audiodev,out.buffer-length=1000000,out.mixing-engine=off,out.fixed-settings=off")
+      audio_flags=(-device usb-audio,audiodev=my_audiodev -audiodev "pipewire,id=my_audiodev,out.buffer-length=1000000,out.mixing-engine=off,out.fixed-settings=off$audio_latency")
       #if QEMU does not support pipewire, fallback to pulseaudio if pipewire's pulseaudio bridge is running
     elif pgrep pulseaudio >/dev/null || pgrep pipewire-pulse >/dev/null ;then
       #Make QEMU use pulseaudio output backend
       debug "Using pulseaudio audio backend"
       audio_flags=(-device usb-audio,audiodev=my_audiodev -audiodev "pa,id=my_audiodev,out.buffer-length=1000000")
     else
-      #Make QEMU use pulseaudio output backend (fallback)
+      #Make QEMU use alsa output backend (fallback)
       debug "Using alsa audio backend"
       audio_flags=(-device usb-audio,audiodev=my_audiodev -audiodev "alsa,id=my_audiodev,out.buffer-length=1000000")
     fi
@@ -1488,7 +2677,7 @@ To get a fresh VM up and running, use a sequence like this:
       for usbdev in $usb_passthrough ;do
         vendor=$(echo "$usbdev" | awk -F: '{print $1}')
         product=$(echo "$usbdev" | awk -F: '{print $2}')
-
+        
         #allow non-root qemu uaccess permission to this usb device (https://bbs.archlinux.org/viewtopic.php?id=209185)
         echo 'SUBSYSTEM=="usb", ATTRS{idVendor}=="'$vendor'", ATTRS{idProduct}=="'$product'", TAG+="uaccess", GROUP="'$USER'", MODE="0660", ENV{UDISKS_IGNORE}="1", ENV{MTP_NO_PROBE}="1", ENV{ID_MTP_DEVICE}="0"' | sudo tee -a "$udev_file" >/dev/null
         usb_forwarding_flags+=(-device usb-host,vendorid=0x$vendor,productid=0x$product,bus=passthrough_xhci.0)
@@ -1518,6 +2707,22 @@ To get a fresh VM up and running, use a sequence like this:
     #forward guest's port 3389 to localhost port of our choice (handled by config file now)
     #network_flags=(-netdev user,id=nic,hostfwd=tcp:127.0.0.1:${rdp_port}-:3389 -device virtio-net-pci,netdev=nic)
     rm -f "$vmdir/qemu.pid"
+    
+    #every mode with a display window of its own shares the folder with Windows through QEMU's built-in Samba. Windows maps it as Z: (RDP has its own folder redirection)
+    if [ "$mode" != boot-nodisplay ] && [ ! -z "$shared_folder" ];then
+      network_flags=("${network_flags[@]/#user,id=nic/user,id=nic,smb=$shared_folder}")
+    fi
+    
+    #optional software TPM 2.0 (tpm=true in the config file). Windows does not need one. The TPM state is in $vmdir/tpm: if Windows ever binds something to this TPM (BitLocker), losing the folder loses the data.
+    tpm_flags=()
+    if [ "$tpm" == true ];then
+      mkdir -p "$vmdir/tpm" || error "failed to create $vmdir/tpm"
+      rm -f "$vmdir/swtpm.sock"
+      #swtpm exits by itself when QEMU disconnects
+      swtpm socket --tpm2 --tpmstate dir="$vmdir/tpm" --ctrl type=unixio,path="$vmdir/swtpm.sock" --pid file="$vmdir/swtpm.pid" --log file="$vmdir/swtpm.log" --terminate --daemon || error "swtpm failed to start. See $vmdir/swtpm.log"
+      tpm_flags=(-chardev socket,id=chrtpm,path="$vmdir/swtpm.sock" -tpmdev emulator,id=tpm0,chardev=chrtpm -device tpm-tis-device,tpmdev=tpm0)
+    fi
+    
     #all QEMU flags are combined together here
     full_qemu_flags=(-M virt,accel=kvm -cpu host -m ${vm_mem}G -smp $num_cores \
       -name BVM,process=bvm \
@@ -1525,6 +2730,8 @@ To get a fresh VM up and running, use a sequence like this:
       -device virtio-balloon \
       -device virtio-serial-pci \
       "${display_flags[@]}" \
+      "${clipboard_flags[@]}" \
+      "${tpm_flags[@]}" \
       -device qemu-xhci \
       -device usb-kbd \
       -device usb-tablet \
@@ -1533,8 +2740,8 @@ To get a fresh VM up and running, use a sequence like this:
       -rtc base=localtime,clock=host,driftfix=none \
       -device virtio-rng-pci,rng=rng0 -object rng-random,id=rng0,filename=/dev/urandom \
       "${network_flags[@]}" \
-      -bios /usr/share/qemu-efi-aarch64/QEMU_EFI.fd \
-      -drive file="$vmdir/disk.qcow2",if=virtio,discard=unmap,aio=threads,cache=none \
+      -bios "$bios_file" \
+      -drive file="$vmdir/disk.qcow2",if=virtio,discard=unmap,detect-zeroes=unmap,aio=threads,cache=none \
       -device qemu-xhci,id=passthrough_xhci,p2=8,p3=8 \
       "${usb_forwarding_flags[@]}")
     
@@ -1563,69 +2770,48 @@ To get a fresh VM up and running, use a sequence like this:
     balloon_popper=$!
     trap "kill $balloon_popper 2>/dev/null" EXIT SIGINT
     
-    retrying=0
+    #debug mode: if QEMU crashes, keep a core dump (it can be several GB: delete it afterwards). It is written to the folder that this command was started in.
+    if [ "$bvm_debug" == true ];then
+      ulimit -c unlimited
+      status "Debug mode: a crash of QEMU writes a core dump to $PWD"
+    fi
+    
     time_before="$(sed 's/\..*//g' /proc/uptime)"
-    while true;do #loop for re-running qemu after BSOD and removing UCPD.sys
-      #run qemu with these flags
-      if [ "$use_taskset" == false ];then
-        qemu-system-aarch64 "${full_qemu_flags[@]}"
-      else
-        #For rockchip (untested but based on https://gist.github.com/Vogtinator/293c4f90c5e92838f7e72610725905fd?permalink_comment_id=5378278#gistcomment-5378278)
-        taskset -c "$(echo "$use_cores" | tr '\n' ',' | sed 's/,$//g')" qemu-system-aarch64 "${full_qemu_flags[@]}"
-      fi
-      qemu_exit_code=$?
+    #run qemu with these flags
+    if [ "$use_taskset" == false ];then
+      "${qemu_command[@]}" "${full_qemu_flags[@]}"
+    else
+      #For rockchip (untested but based on https://gist.github.com/Vogtinator/293c4f90c5e92838f7e72610725905fd?permalink_comment_id=5378278#gistcomment-5378278)
+      taskset -c "$(echo "$use_cores" | tr '\n' ',' | sed 's/,$//g')" "${qemu_command[@]}" "${full_qemu_flags[@]}"
+    fi
+    qemu_exit_code=$?
+    
+    if [ $qemu_exit_code == 0 ];then
+      status "QEMU closed."
       
-      if [ $qemu_exit_code == 0 ];then
-        status "QEMU closed."
-        
-        time_after="$(sed 's/\..*//g' /proc/uptime)"
-        if [ $((time_before+240)) -ge $time_after ];then
-          if [ $retrying == 0 ];then
-            #if qemu ran for less than 240 seconds, the VM likely had a BSOD. Try to fix it and run qemu one more time
-            retrying=1
-            
-            warning "QEMU ran for less than 240 seconds. Windows likely experienced an error during boot. Trying to fix it..."
-            
-            mountpoint="/media/$USER/bvm-mount$rdp_port"
-            if ! (mount_qcow2 "$vmdir/disk.qcow2") ;then
-              (unmount_qcow2)
-              (error "Failed to mount disk.qcow2 to complete repairs")
-              break
-            fi
-            
-            remove_UCPD_from_mountpoint "$mountpoint"
-            unmount_qcow2
-            #continue in loop to restart qemu
-          else
-            #qemu still exited with code 0 in less than 240 seconds
-            warning "Even after attempted repairs, QEMU ran for less than 240 seconds. Windows likely experienced another BSOD during boot. Giving up."
-            break
-          fi
-        else
-          echo -e '\e[103m\e[30mConsider supporting the developer Botspot.\e[96m\e[40m  \e[4mhttps://github.com/sponsors/Botspot\e[0m'
-          break
-        fi
+      time_after="$(sed 's/\..*//g' /proc/uptime)"
+      if [ $((time_before+240)) -ge $time_after ] && [ "$mode" != boot-ramfb ];then
+        #a window that was closed within 4 minutes is often a Windows that did not come up. Nothing is changed in the disk: that was tried before (UCPD.sys removal) and Windows does not need it any more.
+        warning "QEMU ran for less than 240 seconds. If Windows seemed to be stuck while it booted, try '$0 boot-ramfb $vmdir': it uses a simpler display that works in more situations, and F8 there opens the Windows boot menu (5 = safe mode with networking)."
       else
-        (exit $qemu_exit_code) ; qemu_exitcode_analyzer
-        break
+        echo -e '\e[103m\e[30mConsider supporting the developer Botspot.\e[96m\e[40m  \e[4mhttps://github.com/sponsors/Botspot\e[0m'
       fi
-    done
+    else
+      (exit $qemu_exit_code) ; qemu_exitcode_analyzer
+    fi
     
     kill $balloon_popper
+    [ "$tpm" == true ] && kill "$(cat "$vmdir/swtpm.pid" 2>/dev/null)" 2>/dev/null
     sudo rm -f "$udev_file"
     ;;
   connect*)
+    [ "$mode" == connect-freerdp ] && error "FreeRDP support has been removed from BVM. Use '$0 connect-remmina $vmdir' (or just '$0 connect $vmdir') instead."
+    
     #make sure the qemu process is running
     if ! process_exists "$(cat "$vmdir/qemu.pid" 2>/dev/null)" ;then
       error "QEMU does not appear to be running. You need to run the VM first before you can view its screen."
     elif [ -z "$DISPLAY" ] && [ -z "$WAYLAND_DISPLAY" ];then
       error "BVM needs a desktop environment to run $mode"
-    fi
-    
-    if [ "$XDG_SESSION_TYPE" == wayland ];then
-      freerdp_command="wlfreerdp"
-    else
-      freerdp_command="xfreerdp"
     fi
     
     #wait for network port to open, indicating the machine is ready for connection
@@ -1643,28 +2829,6 @@ To get a fresh VM up and running, use a sequence like this:
     
     while true;do #Relaunch the viewer between VM reboots
       case "$mode" in
-        connect-freerdp)
-          
-          if ! command -v $freerdp_command ;then
-            error "FreeRDP 2 cannot be installed on your OS, so it cannot be used. Please use Remmina to connect."
-          fi
-          
-          freerdp_flags=(/v:127.0.0.1:$rdp_port /u:$vm_username /p:$vm_password /relax-order-checks /cert:ignore +auto-reconnect \
-            /dynamic-resolution /sound +window-drag -sec-rdp -sec-tls +offscreen-cache +home-drive +menu-anims +multitouch \
-            -compression -encryption +drives /auto-reconnect-max-retries:10 +async-input +async-channels +clipboard +gfx-progressive \
-            /gfx +aero +bitmap-cache /t:"BVM connect")
-          #support a reduced graphics mode that can be enabled in the config file - for x11 mainly
-          if [ "$reduce_graphics" == true ];then
-            freerdp_flags+=(-window-drag -aero -menu-anims)
-          fi
-          
-          #fullscreen mode: add flag to enable it
-          if [ "$fullscreen" == true ];then
-            freerdp_flags+=(/f)
-          fi
-          
-          $freerdp_command "${freerdp_flags[@]}" "${add_freerdp_flags[@]}"
-          ;;
         connect-remmina|connect)
           
           #change remmina's graphical settings based on reduce_graphics setting
@@ -1677,7 +2841,7 @@ To get a fresh VM up and running, use a sequence like this:
           #Copy new-and-improved remmina config
           grep -qF 'to get microphone input working' "$vmdir/connect.remmina" 2>/dev/null || cp -f "${DIRECTORY}/resources/connect.remmina" "$vmdir/connect.remmina"
           #Use Remmina to set parameters in profile
-          echo -e "$vm_username\n$vm_password\n127.0.0.1:$rdp_port\n$quality\n$HOME\n$(echo "$fullscreen" | sed 's/true/3/g ; s/false/1/g')" | remmina --update-profile "$vmdir/connect.remmina" --set-option username --set-option password --set-option server --set-option quality --set-option drive --set-option viewmode
+          echo -e "$vm_username\n$vm_password\n127.0.0.1:$rdp_port\n$quality\n$shared_folder\n$(echo "$fullscreen" | sed 's/true/3/g ; s/false/1/g')" | remmina --update-profile "$vmdir/connect.remmina" --set-option username --set-option password --set-option server --set-option quality --set-option drive --set-option viewmode
           
           #fullscreen mode - enable toolbar, otherwise hide left-align toolbar which is mostly useless
           if [ "$fullscreen" == true ];then
@@ -1800,199 +2964,3 @@ esac
 
 exit 0
 
-#Below is botspot's scratchpad of notes for getting this running. It is included here for future reference.
-#No commands below will be run by this script. so they can be uncommented.
-
-#Primary information sources that I used for reference:
-#https://youtu.be/HOwslWR8LyY
-#https://github.com/quickemu-project/quickemu
-
-#if the install fails, use the mount mode and check for these files:
-#/media/pi/bvm-mount/$Windows.~BT/Sources/Panther/setuperr.log
-#/media/pi/bvm-mount/Windows/Panther/setuperr.log
-#/media/pi/bvm-mount/Windows/Panther/UnattendGC/setupact.log
-
-#get w11 lite - https://www.youtube.com/watch?v=HrM3xzzgawQ
-#download from https://www.microsoft.com/en-us/evalcenter/download-windows-11-iot-enterprise-ltsc-eval
-#direct download link: https://software-static.download.prss.microsoft.com/dbazure/998969d5-f34g-4e03-ac9d-1f9786c66749/26100.1742.240906-0331.ge_release_svc_refresh_CLIENT_IOT_LTSC_EVAL_A64FRE_en-us.iso
-#disable hourly auto-shutdown after 90 days: https://digitalitskills.com/how-to-stop-windows-server-auto-shutdown-every-hour-after-license-expire/
-
-#activate (run in windows) This is from some youtube video I found years back. Supposedly this is not illegal.
-slmgr /ipk W269N-WFGWX-YVC9B-4J6C9-T83GX
-slmgr /skms kms.digiboy.ir
-slmgr /ato
-#https://github.com/Whitecat18/Windows-Activator/blob/main/Windows-Activator.bat
-#https://github.com/CaptainChicky/Activate-Microsoft-products-for-testing-in-virtual-machines
-
-#debloat and unattend:
-#some unattend debloat stuff pulled from https://schneegans.de/windows/unattend-generator/
-#https://github.com/Raphire/Win11Debloat
-#https://github.com/agadiffe/WindowsMize/blob/main/WindowsMize.ps1
-#https://github.com/memstechtips/UnattendedWinstall
-
-#vm disk settings benchmarks to speed up firstboot (falloc, cache, cluster_size)
-#https://events19.lfasiallc.com/wp-content/uploads/2017/11/Storage-Performance-Tuning-for-FAST-Virtual-Machines_Fam-Zheng.pdf
-
-#solve weird usb passthrough issue - bad socket format
-sudo journalctl -u systemd-udevd #many lines like this: event9: Process '/usr/sbin/th-cmd --socket /var/run/thd.socket --passfd --udev' failed with exit code 1.
-#see the issue, run it with strace
-sudo strace /usr/sbin/th-cmd --socket /var/run/thd.socket --passfd --udev
-#said something about bad socket format for /var/run/thd.socket 
-sudo rm /var/run/thd.socket 
-reboot
-
-#display build information on desktop (run in windows)
-reg add "HKCU\Control Panel\Desktop" /v PaintDesktopVersion /t REG_DWORD /d 0x00000001 /f
-
-#logout on RDP disconnect (reduces idle CPU)
-reg add "HKLM\SOFTWARE\Policies\Microsoft\Windows NT\Terminal Services" /v MaxDisconnectionTime /t REG_DWORD /d 60000 /f
-
-#reset hard drive
-rm -f windows-11arm64/win11.qcow2
-qemu-img create -f qcow2 windows-11arm64/win11.qcow2 40G
-
-#upgrade qemu to 9.2
-sudo apt install -t bookworm-backports --only-upgrade qemu-system-aarch64
-
-#improves sound slightly
-sudo renice -n -20 -p $(pgrep -f /usr/bin/pipewire)
-sudo ionice -c 1 -n 0 -p $(pgrep -f /usr/bin/pipewire)
-
-#botspot's findings:
--bios #is necessary for some reason
-#specifying installation drives as usb is somehow necessary
-# this breaks boot: -global driver=cfi.pflash01,property=secure,value=on
--vga none #seems to break the installer - cannot get drivers
-#these fail to load unattended:
--drive media=cdrom,index=2,file=windows-11arm64/unattended.iso \
--drive media=cdrom,index=0,file=windows-11arm64/Win11_24H2_EnglishInternational_Arm64.iso \
--drive media=cdrom,index=1,file=windows-11arm64/virtio-win.iso \
--display sdl,gl=on #seems to break it. Needs to have no gl=on or sdl only
--device virtio-gpu-pci,xres=1280,yres=800 #with resolution parameters seems to break boot
--display spice-app,gl=on #works but display is completely garbled
--display #option omitted works great, dynamic resizing does work
--display spice-app #works great, dynamic resizing does not work
--display gtk (no gl=on) works
--display sdl #does not work (stuck on boot)
--vga none -device virtio-gpu-pci -display gtk works
--vga none -device virtio-gpu-pci -display sdl,gl=es
-#list all display options: qemu-system-aarch64 -help | grep display
-#get working audio: -device usb-audio,audiodev=my_audiodev -audiodev pipewire,id=my_audiodev
-
-#usb device forwarding: https://gist.github.com/ichisadashioko/cfc6446764516bf7eccaffdb3799f041
- -usb -device usb-host,vendorid=0x'1a40',productid=0x'0101',driver=usb-host
-
-#usb hub forwarding: not sure how to do it
-
-#might help: https://github.com/darkguy2008/hotplugger and https://www.reddit.com/r/VFIO/comments/lbvgpr/hotplugger_real_usb_port_passthrough_for_vfioqemu/
-#might help: https://serverfault.com/questions/667426/pass-an-usb-hub-from-a-kvm-host-to-a-guest-with-libvirt
-
-#shared filesystem
-#https://github.com/virtio-win/kvm-guest-drivers-windows/wiki/Virtiofs:-Shared-file-system
-
-#list all devices: qemu-system-aarch64 -device help
-
-#qemu-img create -f qcow2 windows-11arm64/usb-drive.qcow2 2G
-
-#make ethernet bridge to share IP
-#https://ahelpme.com/linux/howto-do-qemu-full-virtualization-with-macvtap-networking/
-sudo ip link add link eth0 name macvtap0 type macvtap mode bridge
-sudo ip link set macvtap0 up
-sudo chown $USER:$USER /dev/tap$(cat /sys/class/net/macvtap0/ifindex)
-
-#remmina is faster than all other viewing methods that work, has perfect audio too
-#remmina config doc: https://remmina.gitlab.io/remminadoc.gitlab.io/md__builds__remmina_remmina_ci__remmina_wiki__remmina__config__file__options.html
-#remmina colordepth options: https://github.com/FreeRDP/Remmina/blob/7bc15420b6e6a2a4540f20aeccfabe9cff4b7fd3/plugins/rdp/rdp_plugin.c#L1686
-#cannot run program on startup because exec= uses FreeRDP_AlternateShell which is ignored by Windows 10/11
-#See https://superuser.com/questions/1202758/how-to-use-rdp-alternative-shell-inital-program-in-windows-10education
-#RemoteApp not supported by Remmina
-#https://stackoverflow.com/questions/1226772/can-rdp-clients-launch-remote-applications-and-not-desktops
-remmina -c /home/pi/windows-11arm64/group_rdp_quick-connect_127-0-0-1.remmina --enable-extra-hardening --no-tray-icon
-
-#running apps individually outside a windows display environment using RemoteApp:
-#https://github.com/xiagw/winapps
-xfreerdp3 /v:127.0.0.1 /u:Quickemu /p:quickemu /relax-order-checks /cert:ignore +auto-reconnect /app:program:'%windir%\system32\cmd.exe'
-#It keeps getting X11 errors on window resize events, sadly
-#freerdp needs a fix, see my issue: https://github.com/FreeRDP/FreeRDP/issues/11218
-
-#good command for high speed RDP
-wlfreerdp /v:127.0.0.1 /u:Quickemu /p:quickemu /relax-order-checks /cert:ignore +auto-reconnect /dynamic-resolution /sound /workarea +window-drag -sec-rdp -sec-tls +offscreen-cache +home-drive +menu-anims +multitouch -compression -encryption +drives /auto-reconnect-max-retries:0 +async-input +async-channels +clipboard +gfx-progressive /gfx +aero  /t:"BVM Project - RDP Viewer"
-#best wlfreerdp3 command I could get
-wlfreerdp3 /v:127.0.0.1 /u:Quickemu /p:quickemu /relax-order-checks /cert:ignore +auto-reconnect /dynamic-resolution /sound  -async-update +async-channels /gfx:progressive/clearcodec
-#wlfreerdp3 seems to not copy text from host to guest, so wlfreerdp it is I guess.
-
-#pad firmware files to solve error "qemu-system-aarch64: device requires 67108864 bytes, block backend provides 1966080 bytes"
-#solution found on https://www.kraxel.org/blog/2022/05/edk2-virt-quickstart/
-if false;then
-dd of="windows-11arm64/OVMF_VARS.fd" if="/dev/zero" bs=1M count=64
-dd of="windows-11arm64/OVMF_VARS.fd" if="/usr/share/OVMF/OVMF_VARS.fd" conv=notrunc
-dd of="windows-11arm64/OVMF_CODE.fd" if="/dev/zero" bs=1M count=64
-dd of="windows-11arm64/OVMF_CODE.fd" if="/usr/share/OVMF/OVMF_CODE.fd" conv=notrunc
-#OVMF_CODE does not work, but QEMU_EFI does
-dd of="windows-11arm64/QEMU_EFI.fd" if="/dev/zero" bs=1M count=64
-dd of="windows-11arm64/QEMU_EFI.fd" if="/usr/share/qemu-efi-aarch64/QEMU_EFI.fd" conv=notrunc
-fi
-
-#working command from https://youtu.be/HOwslWR8LyY:
-qemu-system-aarch64 -M virt -cpu host -accel kvm -m 4G -smp 4 \
--device ramfb -device virtio-gpu-pci -bios /usr/share/qemu-efi-aarch64/QEMU_EFI.fd \
--device qemu-xhci -device usb-kbd -device usb-tablet \
--drive file=Win11_24H2_English_Arm64.iso,media=cdrom,if=none,id=inst -device usb-storage,drive=inst \
--drive file=virtio-win.iso,media=cdrom,if=none,id=iso -device usb-storage,drive=iso \
--drive file=win11.qcow2,if=virtio \
--nic user,model=virtio-net-pci,mac=00:11:22:33:44:55
-
-#shortened version from quickemu (does not work)
-/usr/bin/qemu-system-aarch64 -name windows-11arm64,process=windows-11arm64 -machine virt,highmem=on,accel=kvm \
--global kvm-pit.lost_tick_policy=discard -global ICH9-LPC.disable_s3=1 \
--cpu host -smp cores=4,threads=1,sockets=1 -m 4G \
--device virtio-balloon -pidfile windows-11arm64/windows-11arm64.pid \
--rtc base=localtime,clock=host,driftfix=slew \
--vga none -device virtio-gpu-pci,xres=1280,yres=800 -display sdl,gl=on \
--device virtio-rng-pci,rng=rng0 -object rng-random,id=rng0,filename=/dev/urandom \
--device usb-ehci,id=input \
--device usb-kbd,bus=input.0 -k en-us \
--device usb-tablet,bus=input.0 -audiodev pa,id=audio0 \
--device intel-hda \
--device virtio-net,netdev=nic -netdev user,hostname=windows-11arm64,hostfwd=tcp::22220-:22,id=nic -global driver=cfi.pflash01,property=secure,value=on \
--drive if=pflash,format=raw,unit=0,file=windows-11arm64/OVMF_CODE.fd,readonly=on \
--drive if=pflash,format=raw,unit=1,file=windows-11arm64/OVMF_VARS.fd \
--drive media=cdrom,index=2,file=windows-11arm64/unattended.iso \
--drive media=cdrom,index=0,file=windows-11arm64/Win11_24H2_EnglishInternational_Arm64.iso \
--drive media=cdrom,index=1,file=windows-11arm64/virtio-win.iso \
--device virtio-blk-pci,drive=SystemDisk -drive id=SystemDisk,if=none,format=qcow2,file=windows-11arm64/disk.qcow2
-
-#quickemu
-/usr/bin/qemu-system-aarch64 -name windows-11arm64,process=windows-11arm64 -machine virt,highmem=on,accel=kvm \
--global kvm-pit.lost_tick_policy=discard -global ICH9-LPC.disable_s3=1 \
--cpu host -smp cores=4,threads=1,sockets=1 -m 4G \
--device virtio-balloon -pidfile windows-11arm64/windows-11arm64.pid \
--rtc base=localtime,clock=host,driftfix=slew \
--vga none -device virtio-gpu-pci,xres=1280,yres=800 -display sdl,gl=on \
--device virtio-rng-pci,rng=rng0 -object rng-random,id=rng0,filename=/dev/urandom \
--device qemu-xhci,id=spicepass -chardev spicevmc,id=usbredirchardev1,name=usbredir \
--device usb-redir,chardev=usbredirchardev1,id=usbredirdev1 -chardev spicevmc,id=usbredirchardev2,name=usbredir \
--device usb-redir,chardev=usbredirchardev2,id=usbredirdev2 -chardev spicevmc,id=usbredirchardev3,name=usbredir \
--device usb-redir,chardev=usbredirchardev3,id=usbredirdev3 \
--device pci-ohci,id=smartpass \
--device usb-ccid -chardev spicevmc,id=ccid,name=smartcard \
--device ccid-card-passthru,chardev=ccid \
--device usb-ehci,id=input \
--device usb-kbd,bus=input.0 -k en-us \
--device usb-tablet,bus=input.0 \
--audiodev pa,id=audio0 -device intel-hda -device hda-micro,audiodev=audio0 \
--device virtio-net,netdev=nic -netdev user,hostname=windows-11arm64,hostfwd=tcp::22220-:22,id=nic -global driver=cfi.pflash01,property=secure,value=on \
--drive if=pflash,format=raw,unit=0,file=windows-11arm64/OVMF_CODE.fd,readonly=on \
--drive if=pflash,format=raw,unit=1,file=windows-11arm64/OVMF_VARS.fd \
--drive media=cdrom,index=2,file=windows-11arm64/unattended.iso \
--drive media=cdrom,index=0,file=windows-11arm64/Win11_24H2_EnglishInternational_Arm64.iso \
--drive media=cdrom,index=1,file=windows-11arm64/virtio-win.iso \
--device virtio-blk-pci,drive=SystemDisk \
--drive id=SystemDisk,if=none,format=qcow2,file=windows-11arm64/disk.qcow2 \
--monitor unix:windows-11arm64/windows-11arm64-monitor.socket,server,nowait \
--serial unix:windows-11arm64/windows-11arm64-serial.socket,server,nowait
-
-#working command:
-qemu-system-aarch64 -M virt -cpu host -accel kvm -m 4G -smp 4 -device virtio-gpu-pci -bios \
-/usr/share/qemu-efi-aarch64/QEMU_EFI.fd -device qemu-xhci -device usb-kbd -device usb-tablet -drive file=win11.qcow2,if=virtio \
--nic user,model=virtio-net-pci,mac=00:11:22:33:44:55

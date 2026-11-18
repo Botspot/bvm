@@ -54,7 +54,21 @@ rdp_port=3389
 #Uncomment to view the VM in fullscreen. Uncommenting this overrides the fullscreen setting in GUI.
 #fullscreen=true
 
-#Uncomment to enable additional output to help troubleshoot issues.
+#The folder that is shared with Windows: as a drive in the connect mode (Remmina), and as drive Z: in the experimental GPU mode (boot-gpu).
+#By default this is your whole home folder, so Windows can read, change and delete everything that you can. In GPU mode Windows may log in to it without a password.
+#Put another folder here, or leave it empty (shared_folder='') to share nothing.
+#shared_folder="$HOME"
+
+#GPU mode (boot-gpu) only: the refresh rate that Windows thinks the screen has, in frames per second. Default: 30.
+#A Raspberry Pi cannot render more than about 30 frames per second this way, so 30 is recommended: 60 makes Windows ask for frames that are never ready, and animations look worse.
+#Other, faster boards may like a higher number.
+#guest_hz=30
+
+#Uncomment to enable a software TPM 2.0 (swtpm) for the VM. Windows does not need one: it installs and updates fine without it. The TPM keeps its state in the tpm folder of the VM:
+#if you use it for anything that Windows binds to the TPM (BitLocker), back that folder up, as losing it loses the data.
+#tpm=true
+
+#Uncomment to enable debug mode: additional output to help troubleshoot issues, and a core dump (several GB, in the folder BVM was started from) if QEMU crashes.
 #bvm_debug=true
 #Even more debugging: (displays every command run by the script)
 #set -x
@@ -63,10 +77,6 @@ rdp_port=3389
 #disable_updates=true
 #Most users should not need to be modifying the bvm script. It is preferable to keep all changes in this config file.
 #If your situation needs more flexibility than what the config file offers, contact me and I can try to implement something that helps everyone.
-
-#Pass additional flags to the FreeRDP viewer
-#add_freerdp_flags=(-drives -home-drive -wallpaper)
-#See all options by running wlfreerdp -help or xfreerdp -help
 
 #Network settings: leave this alone unless you know what you are doing and need to change it.
 #Put a # in front of network_flags to disable the VM's network connection.

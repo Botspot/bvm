@@ -1,0 +1,659 @@
+diff --git a/server/render_context.c b/server/render_context.c
+index 91f187c..c70c026 100644
+--- a/server/render_context.c
++++ b/server/render_context.c
+@@ -6,6 +6,8 @@
+ #include "render_context.h"
+ 
+ #include <errno.h>
++#include <stdio.h>
++#include <stdlib.h>
+ #include <sys/mman.h>
+ #include <sys/socket.h>
+ #include <unistd.h>
+@@ -203,7 +205,7 @@ render_context_dispatch_create_resource(struct render_context *ctx,
+    bool ok = render_state_create_resource(ctx->ctx_id, req->res_id, req->blob_id,
+                                           req->blob_size, req->blob_flags, &reply.fd_type,
+                                           &res_fd, &reply.map_info, &reply.vulkan_info,
+-                                          &reply.export_format);
++                                          &reply.export_format, &reply.export_modifier);
+    if (!ok)
+       return render_socket_send_reply(&ctx->socket, &reply, sizeof(reply));
+ 
+@@ -461,6 +463,33 @@ render_context_main(const struct render_context_args *args)
+ 
+    assert(args->valid && args->ctx_id && args->ctx_fd >= 0);
+ 
++   /* BVMGPU diagnostics (README item 116): with BVM_GFXR_DIR set, give every render-server
++    * context its own GFXReconstruct capture file (the layer names the file from the environment
++    * once, so contexts started in the same second would overwrite each other otherwise). */
++   {
++      const char *gfxr_dir = getenv("BVM_GFXR_DIR");
++      if (gfxr_dir && *gfxr_dir) {
++         char gfxr_path[512];
++         snprintf(gfxr_path, sizeof(gfxr_path), "%s/ctx%u_pid%d.gfxr", gfxr_dir,
++                  (unsigned)args->ctx_id, (int)getpid());
++         setenv("GFXRECON_CAPTURE_FILE", gfxr_path, 1);
++         setenv("GFXRECON_CAPTURE_FILE_TIMESTAMP", "false", 1);
++         /* load the layer only in the workers (not in the launcher's vulkaninfo, QEMU, ...) */
++         setenv("VK_INSTANCE_LAYERS", "VK_LAYER_LUNARG_gfxreconstruct", 1);
++         const char *v = getenv("BVM_GFXR_LAYER_PATH");   /* e.g. a newer self-built layer */
++         if (v && *v)
++            setenv("VK_LAYER_PATH", v, 1);
++         v = getenv("BVM_GFXR_COMPRESSION");
++         setenv("GFXRECON_CAPTURE_COMPRESSION_TYPE", v && *v ? v : "ZSTD", 1);
++         v = getenv("BVM_GFXR_MEM");
++         setenv("GFXRECON_MEMORY_TRACKING_MODE", v && *v ? v : "page_guard", 1);
++         setenv("GFXRECON_PAGE_GUARD_PERSISTENT_MEMORY", "true", 1);
++         v = getenv("BVM_GFXR_FLUSH");
++         setenv("GFXRECON_CAPTURE_FILE_FLUSH", v && *v ? v : "true", 1);
++         setenv("GFXRECON_LOG_LEVEL", "warn", 1);
++      }
++   }
++
+    if (!render_state_init(args->init_flags)) {
+       close(args->ctx_fd);
+       return false;
+diff --git a/server/render_protocol.h b/server/render_protocol.h
+index c3bd2d0..24208f1 100644
+--- a/server/render_protocol.h
++++ b/server/render_protocol.h
+@@ -160,6 +160,8 @@ struct render_context_op_create_resource_reply {
+     * to it as a bare fd, and the guest's own idea of the format is a
+     * depth/bpp guess with no channel order in it. */
+    uint32_t export_format;
++   /* DRM format modifier of an exported dmabuf, or 0 (linear/unknown) */
++   uint64_t export_modifier;
+    /* followed by 1 fd if not VIRGL_RESOURCE_FD_INVALID */
+ };
+ 
+diff --git a/server/render_state.c b/server/render_state.c
+index f0f5487..71fde29 100644
+--- a/server/render_state.c
++++ b/server/render_state.c
+@@ -364,7 +364,8 @@ render_state_create_resource(uint32_t ctx_id,
+                              int *out_res_fd,
+                              uint32_t *out_map_info,
+                              struct virgl_resource_vulkan_info *out_vulkan_info,
+-                             uint32_t *out_export_format)
++                             uint32_t *out_export_format,
++                             uint64_t *out_export_modifier)
+ {
+    struct render_context *ctx = render_state_lookup_context(ctx_id);
+    if (!ctx)
+@@ -382,7 +383,8 @@ render_state_create_resource(uint32_t ctx_id,
+    case RENDER_BACKEND_NEPTUNE:
+       return npt_renderer_create_resource(ctx_id, res_id, blob_id, blob_size,
+                                           blob_flags, out_fd_type, out_res_fd,
+-                                          out_map_info, out_export_format);
++                                          out_map_info, out_export_format,
++                                          out_export_modifier);
+ #endif
+    default:
+       return false;
+diff --git a/server/render_state.h b/server/render_state.h
+index bc562b8..a0b1e7e 100644
+--- a/server/render_state.h
++++ b/server/render_state.h
+@@ -42,7 +42,8 @@ render_state_create_resource(uint32_t ctx_id,
+                              int *out_res_fd,
+                              uint32_t *out_map_info,
+                              struct virgl_resource_vulkan_info *out_vulkan_info,
+-                             uint32_t *out_export_format);
++                             uint32_t *out_export_format,
++                             uint64_t *out_export_modifier);
+ 
+ bool
+ render_state_import_resource(uint32_t ctx_id,
+diff --git a/src/neptune/npt_context.c b/src/neptune/npt_context.c
+index 62881f4..42be4d1 100644
+--- a/src/neptune/npt_context.c
++++ b/src/neptune/npt_context.c
+@@ -1418,6 +1418,21 @@ npt_context_dispatch_one_command(struct npt_context *ctx,
+    if (npt_cs_decoder_get_fatal(dec))
+       return false;
+ 
++   /* BVM-GPU-TRACE: with NPT_TRACE=1 log every incoming command (capped) so a guest crash can be correlated
++    * with the last calls it made. cmd_type: group(8) | interface(16) | method(8) for COM calls (group 255). */
++   {
++      static int trace_on = -1;
++      static unsigned trace_left = 300000;
++      if (trace_on < 0)
++         trace_on = getenv("NPT_TRACE") != NULL;
++      if (trace_on && trace_left) {
++         trace_left--;
++         npt_log("TRACE ctx=%u type=0x%08x (grp=%u if=%u meth=%u) flags=%u obj=%" PRIu64 " size=%u",
++                 ctx->ctx_id, peek.cmd_type, peek.cmd_type >> 24, (peek.cmd_type >> 8) & 0xffff,
++                 peek.cmd_type & 0xff, peek.cmd_flags, (uint64_t)peek.object_id, peek.cmd_size);
++      }
++   }
++
+    const uint32_t group = (peek.cmd_type >> 24) & 0xFFu;
+ 
+    if (group == 0) {
+@@ -1665,6 +1680,7 @@ npt_context_create_resource(struct npt_context *ctx,
+          .u.fd = pb->fd,
+          .map_info = 0,
+          .export_format = pb->virgl_format,
++         .export_modifier = pb->modifier,
+       };
+       free(pb);
+ 
+@@ -1678,7 +1694,8 @@ npt_context_register_pending_blob(struct npt_context *ctx,
+                                   enum virgl_resource_fd_type fd_type,
+                                   int fd,
+                                   uint64_t size,
+-                                  uint32_t virgl_format)
++                                  uint32_t virgl_format,
++                                  uint64_t modifier)
+ {
+    struct npt_pending_blob *pb = calloc(1, sizeof(*pb));
+    if (!pb)
+@@ -1689,6 +1706,7 @@ npt_context_register_pending_blob(struct npt_context *ctx,
+    pb->fd = fd;
+    pb->size = size;
+    pb->virgl_format = virgl_format;
++   pb->modifier = modifier;
+ 
+    mtx_lock(&ctx->pending_blob_mutex);
+    _mesa_hash_table_insert(ctx->pending_blob_table, &pb->blob_id, pb);
+diff --git a/src/neptune/npt_context.h b/src/neptune/npt_context.h
+index 9ef87e8..871e2cd 100644
+--- a/src/neptune/npt_context.h
++++ b/src/neptune/npt_context.h
+@@ -28,6 +28,8 @@ struct npt_pending_blob {
+    /* enum virgl_formats the exporting context created the texture with,
+     * or 0 if unknown.  See virgl_resource::export_format. */
+    uint32_t virgl_format;
++   /* DRM format modifier of the exported dmabuf, or 0. */
++   uint64_t modifier;
+ };
+ 
+ /* Sync Map/Unmap bookkeeping.  Keyed by (resource_id, subresource):
+@@ -332,7 +334,8 @@ npt_context_register_pending_blob(struct npt_context *ctx,
+                                   enum virgl_resource_fd_type fd_type,
+                                   int fd,
+                                   uint64_t size,
+-                                  uint32_t virgl_format);
++                                  uint32_t virgl_format,
++                                  uint64_t modifier);
+ 
+ struct npt_cmd_com_release_wait;
+ 
+diff --git a/src/neptune/npt_overrides_shared_handle.c b/src/neptune/npt_overrides_shared_handle.c
+index e5999e1..b78353a 100644
+--- a/src/neptune/npt_overrides_shared_handle.c
++++ b/src/neptune/npt_overrides_shared_handle.c
+@@ -130,8 +130,129 @@ struct npt_dispatch_idxgiresource1_overrides npt_idxgiresource1_overrides = {
+    .CreateSharedHandle = reject_IDXGIResource1_CreateSharedHandle,
+ };
+ 
++/* -------------------------------------------------------------------- */
++/* BVM-GPU capability shim (opt-in: NPT_CAPS_SHIM=1)                    */
++/* -------------------------------------------------------------------- */
++/* Experiment: V3D (Raspberry Pi 5) cannot do typed UAV stores (no shaderStorageImageWriteWithoutFormat), lacks
++ * RGB32 / RGBA16 UNORM+SNORM texture+render support and BC4-7, and has no doubles / min-precision / stencil-export /
++ * viewport-index. The Windows D3D11 runtime/DWM probes these and gives up on the device (dwm.exe dies in dwmcore.dll,
++ * 0x889800b0). With the shim, the answers are raised to what a fully featured device (llvmpipe, where the guest got as far
++ * as creating swapchains) reports. This is a LIE about the hardware: apps that really use these formats/features break.
++ * Tables below are llvmpipe's real answers, taken from NPT_TRACE logs. */
++
++struct bvm_fmt_floor { uint8_t fmt; uint32_t mask; };
++static const struct bvm_fmt_floor bvm_fmt_floor[] = {
++   {1,0x32f673f3},{2,0x32f6f3fb},{3,0x32f673fb},{4,0x32f673fb},{5,0x30f673f3},{6,0x30f6f3fb},{7,0x30f673fb},{8,0x30f673fb},
++   {9,0x32f6f3f3},{10,0x32fef3f3},{11,0x32f6f3f3},{12,0x32f673f3},{13,0x32f673f3},{14,0x32f673f3},{15,0x32f673f3},
++   {16,0x32f6f3fb},{17,0x32f673fb},{18,0x32f673fb},{19,0x24f717f0},{20,0x24f717f0},{21,0x24f717f0},{22,0x24f717f0},
++   {23,0x32f6f3f3},{24,0x32fef3f3},{25,0x32f673f3},{27,0x32f6f3f3},{28,0x32fef3f3},{29,0x30fef3f1},{30,0x32f673f3},
++   {31,0x32f673f3},{32,0x32f673f3},{33,0x32f6f3f3},{34,0x32f6f3f3},{35,0x32f6f3f3},{36,0x32f673f3},{37,0x32f673f3},
++   {38,0x32f673f3},{39,0x36f677f3},{40,0x24f717f0},{41,0x36f6f7fb},{42,0x32f673ff},{43,0x32f673fb},{44,0x24f717f0},
++   {45,0x24f717f0},{46,0x24f717f0},{47,0x24f717f0},{48,0x32f6f3f3},{49,0x32f6f3f3},{50,0x32f673f3},{51,0x32f673f3},
++   {52,0x32f673f3},{53,0x36f6f7f3},{54,0x36f6f7f3},{55,0x24f717f0},{56,0x36f6f7f3},{57,0x32f673f7},{58,0x32f673f3},
++   {59,0x32f673f3},{60,0x32f6f3f3},{61,0x32f6f3f3},{62,0x32f673f3},{63,0x32f673f3},{64,0x32f673f3},{65,0x32f6f3f3},
++   {70,0x209213e0},{71,0x209213e0},{72,0x209213e0},{73,0x209213e0},{74,0x209213e0},{75,0x209213e0},{76,0x209213e0},
++   {77,0x209213e0},{78,0x209213e0},{79,0x209213e0},{80,0x209213e0},{81,0x209213e0},{82,0x209213e0},{83,0x209213e0},
++   {84,0x209213e0},{87,0x32fef3f3},{88,0x32f6f3f3},{90,0x32f6f3f3},{91,0x30fef3f1},{92,0x32f6f3f3},{93,0x30f6f3f1},
++   {94,0x209213e0},{95,0x209213e0},{96,0x209213e0},{97,0x209213e0},{98,0x209213e0},{99,0x209213e0},
++};
++
++/* D3D11_FEATURE_FORMAT_SUPPORT2 answers (fail=1: the reference device itself answers E_FAIL, so leave as is) */
++struct bvm_sup2 { uint8_t fmt; uint32_t val; uint8_t fail; };
++static const struct bvm_sup2 bvm_sup2[] = {
++   {1,0x3c0,0},{2,0x3c0,0},{3,0x3c0,0},{4,0x3c0,0},{5,0x300,0},{6,0x300,0},{7,0x300,0},{8,0x300,0},{9,0x3c0,0},
++   {10,0x3c0,0},{11,0x3c0,0},{12,0x3c0,0},{13,0x3c0,0},{14,0x3c0,0},{15,0x3c0,0},{16,0x3c0,0},{17,0x3c0,0},{18,0x3c0,0},
++   {23,0x3c0,0},{24,0x3c0,0},{25,0x3c0,0},{27,0x3c0,0},{28,0x3c0,0},{29,0x300,0},{30,0x3c0,0},{31,0x3c0,0},{32,0x3c0,0},
++   {33,0x3c0,0},{34,0x3c0,0},{35,0x3c0,0},{36,0x3c0,0},{37,0x3c0,0},{38,0x3c0,0},{39,0x3c0,0},{40,0x200,0},{41,0x3c0,0},
++   {42,0x3ef,0},{43,0x3df,0},{48,0x3c0,0},{49,0x3c0,0},{50,0x3c0,0},{51,0x3c0,0},{52,0x3c0,0},{53,0x3c0,0},{54,0x3c0,0},
++   {55,0x200,0},{56,0x3c0,0},{57,0x3c0,0},{58,0x3c0,0},{59,0x3c0,0},{60,0x3c0,0},{61,0x3c0,0},{62,0x3c0,0},{63,0x3c0,0},
++   {64,0x3c0,0},{65,0x3c0,0},{70,0x200,0},{71,0x200,0},{72,0x200,0},{73,0x200,0},{74,0x200,0},{75,0x200,0},{76,0x200,0},
++   {77,0x200,0},{78,0x200,0},{79,0x200,0},{80,0x200,0},{81,0x200,0},{82,0x200,0},{83,0x200,0},{84,0x200,0},{87,0x3c0,0},
++   {88,0x3c0,0},{90,0x3c0,0},{91,0x300,0},{92,0x3c0,0},{93,0x300,0},{94,0x200,0},{95,0x200,0},{96,0x200,0},{97,0x200,0},
++   {98,0x200,0},{99,0x200,0},{19,0,1},{20,0,1},{21,0,1},{22,0,1},{44,0,1},{45,0,1},{46,0,1},{47,0,1},
++};
++
++static int
++bvm_caps_shim_enabled(void)
++{
++   static int on = -1;
++   if (on < 0)
++      on = getenv("NPT_CAPS_SHIM") != NULL;
++   return on;
++}
++
++static HRESULT
++bvm_ID3D11Device_CheckFormatSupport(
++   UNUSED struct npt_dispatch_context *ctx,
++   struct npt_command_ID3D11Device_CheckFormatSupport *args,
++   PFN_ID3D11Device_CheckFormatSupport original)
++{
++   HRESULT hr = original(args->_self, args->Format, args->pFormatSupport);
++   if (bvm_caps_shim_enabled() && hr == 0 && args->pFormatSupport) {
++      for (unsigned i = 0; i < ARRAY_SIZE(bvm_fmt_floor); i++) {
++         if (bvm_fmt_floor[i].fmt == (unsigned)args->Format) {
++            *args->pFormatSupport |= bvm_fmt_floor[i].mask;
++            break;
++         }
++      }
++   }
++   return hr;
++}
++
++static HRESULT
++bvm_ID3D11Device_CheckFeatureSupport(
++   UNUSED struct npt_dispatch_context *ctx,
++   struct npt_command_ID3D11Device_CheckFeatureSupport *args,
++   PFN_ID3D11Device_CheckFeatureSupport original)
++{
++   HRESULT hr = original(args->_self, args->Feature, args->pFeatureSupportData, args->FeatureSupportDataSize);
++   if (!bvm_caps_shim_enabled() || !args->pFeatureSupportData)
++      return hr;
++
++   uint32_t *d = (uint32_t *)args->pFeatureSupportData;
++   const unsigned size = args->FeatureSupportDataSize;
++   switch ((int)args->Feature) {
++   case 1: /* D3D11_FEATURE_DOUBLES: DoublePrecisionFloatShaderOps */
++      if (hr == 0 && size >= 4)
++         d[0] = 1;
++      break;
++   case 3: /* D3D11_FEATURE_FORMAT_SUPPORT2: { InFormat, OutFormatSupport2 } */
++      if (size >= 8) {
++         for (unsigned i = 0; i < ARRAY_SIZE(bvm_sup2); i++) {
++            if (bvm_sup2[i].fmt == d[0]) {
++               if (!bvm_sup2[i].fail) {
++                  d[1] |= bvm_sup2[i].val;
++                  hr = 0;
++               }
++               break;
++            }
++         }
++      }
++      break;
++   case 8: /* D3D11_FEATURE_SHADER_MIN_PRECISION_SUPPORT: 2 = 16-bit */
++      if (hr == 0 && size >= 8) {
++         d[0] = 2;
++         d[1] = 2;
++      }
++      break;
++   case 14: /* D3D11_FEATURE_D3D11_OPTIONS2: PSSpecifiedStencilRefSupported */
++      if (hr == 0 && size >= 4)
++         d[0] = 1;
++      break;
++   case 15: /* D3D11_FEATURE_D3D11_OPTIONS3: VPAndRTArrayIndexFromAnyShaderFeedingRasterizer */
++      if (hr == 0 && size >= 4)
++         d[0] = 1;
++      break;
++   default:
++      break;
++   }
++   return hr;
++}
++
+ struct npt_dispatch_id3d11device_overrides npt_id3d11device_overrides = {
+    .OpenSharedResource = reject_ID3D11Device_OpenSharedResource,
++   .CheckFormatSupport = bvm_ID3D11Device_CheckFormatSupport,
++   .CheckFeatureSupport = bvm_ID3D11Device_CheckFeatureSupport,
+ };
+ 
+ struct npt_dispatch_id3d11device1_overrides npt_id3d11device1_overrides = {
+diff --git a/src/neptune/npt_profile.c b/src/neptune/npt_profile.c
+index 2f78948..7e1cd6c 100644
+--- a/src/neptune/npt_profile.c
++++ b/src/neptune/npt_profile.c
+@@ -177,10 +177,18 @@ npt_profile_dump(const char *reason)
+ }
+ 
+ void
+-npt_profile_log_q_retire(uint32_t ring_idx, uint64_t fence_id,
+-                         int sync_fd, uint64_t poll_us, int rc)
++npt_profile_log_q_retire(uint32_t ctx_id, uint32_t ring_idx,
++                         uint64_t fence_id, int sync_fd,
++                         uint64_t poll_us, int rc,
++                         uint64_t queued_ns, uint64_t start_ns,
++                         uint64_t end_ns)
+ {
+-   npt_log("NPT-Q-RETIRE queue=%u fence_id=%" PRIu64
+-           " sync_fd=%d poll_us=%" PRIu64 " rc=%d",
+-           ring_idx, fence_id, sync_fd, poll_us, rc);
++   /* queued/start/end are CLOCK_MONOTONIC us: when the fence was paired
++    * with its wait source, when the worker began polling, when the poll
++    * returned.  Same clock as ftrace's "mono" and python time.monotonic. */
++   npt_log("NPT-Q-RETIRE ctx=%u queue=%u fence_id=%" PRIu64
++           " sync_fd=%d poll_us=%" PRIu64 " rc=%d queued_us=%" PRIu64
++           " start_us=%" PRIu64 " end_us=%" PRIu64,
++           ctx_id, ring_idx, fence_id, sync_fd, poll_us, rc,
++           queued_ns / 1000, start_ns / 1000, end_ns / 1000);
+ }
+diff --git a/src/neptune/npt_profile.h b/src/neptune/npt_profile.h
+index 7e6276c..6b654f3 100644
+--- a/src/neptune/npt_profile.h
++++ b/src/neptune/npt_profile.h
+@@ -69,8 +69,11 @@ void npt_profile_unregister_ring(struct npt_ring *ring);
+ /* Emit one NPT-Q-RETIRE line per fence the queue worker retires.
+  * poll_us is the wall-time spent in npt_wait_sync_fd; rc is its
+  * return code (>0 signalled, 0 timeout, <0 error). */
+-void npt_profile_log_q_retire(uint32_t ring_idx, uint64_t fence_id,
+-                              int sync_fd, uint64_t poll_us, int rc);
++void npt_profile_log_q_retire(uint32_t ctx_id, uint32_t ring_idx,
++                              uint64_t fence_id, int sync_fd,
++                              uint64_t poll_us, int rc,
++                              uint64_t queued_ns, uint64_t start_ns,
++                              uint64_t end_ns);
+ 
+ static inline bool
+ npt_profile_enabled(void)
+diff --git a/src/neptune/npt_queue.c b/src/neptune/npt_queue.c
+index 9ea3731..490d05e 100644
+--- a/src/neptune/npt_queue.c
++++ b/src/neptune/npt_queue.c
+@@ -284,8 +284,15 @@ retire:;
+             (int64_t)(t1.tv_sec  - t0.tv_sec ) * 1000000000ll +
+             (int64_t)(t1.tv_nsec - t0.tv_nsec);
+          const uint64_t wait_us = dt_ns > 0 ? (uint64_t)(dt_ns / 1000) : 0;
+-         npt_profile_log_q_retire(queue->ring_idx, sync->fence_id,
+-                                  sync->sync_fd, wait_us, rc);
++         const uint64_t end_ns = (uint64_t)t1.tv_sec * 1000000000ull +
++                                 (uint64_t)t1.tv_nsec;
++         const uint64_t start_ns = (uint64_t)t0.tv_sec * 1000000000ull +
++                                   (uint64_t)t0.tv_nsec;
++         const uint64_t queued_ns = sync->deadline_ns -
++            (uint64_t)NPT_QUEUE_DEVICE_LOST_SEC * 1000000000ull;
++         npt_profile_log_q_retire(queue->context->ctx_id, queue->ring_idx,
++                                  sync->fence_id, sync->sync_fd, wait_us, rc,
++                                  queued_ns, start_ns, end_ns);
+       }
+ 
+       list_del(&sync->head);
+diff --git a/src/neptune/npt_renderer.c b/src/neptune/npt_renderer.c
+index a70af01..987c0d2 100644
+--- a/src/neptune/npt_renderer.c
++++ b/src/neptune/npt_renderer.c
+@@ -279,7 +279,8 @@ npt_renderer_create_resource(uint32_t ctx_id,
+                              enum virgl_resource_fd_type *out_fd_type,
+                              int *out_res_fd,
+                              uint32_t *out_map_info,
+-                             uint32_t *out_export_format)
++                             uint32_t *out_export_format,
++                             uint64_t *out_export_modifier)
+ {
+    struct npt_context *ctx = npt_renderer_lookup_context(ctx_id);
+    if (!ctx)
+@@ -293,6 +294,7 @@ npt_renderer_create_resource(uint32_t ctx_id,
+    *out_res_fd = blob.u.fd;
+    *out_map_info = blob.map_info;
+    *out_export_format = blob.export_format;
++   *out_export_modifier = blob.export_modifier;
+ 
+    return true;
+ }
+diff --git a/src/neptune/npt_renderer.h b/src/neptune/npt_renderer.h
+index 4f4f570..8cae5b7 100644
+--- a/src/neptune/npt_renderer.h
++++ b/src/neptune/npt_renderer.h
+@@ -71,7 +71,8 @@ npt_renderer_create_resource(uint32_t ctx_id,
+                              enum virgl_resource_fd_type *out_fd_type,
+                              int *out_res_fd,
+                              uint32_t *out_map_info,
+-                             uint32_t *out_export_format);
++                             uint32_t *out_export_format,
++                             uint64_t *out_export_modifier);
+ 
+ bool
+ npt_renderer_import_resource(uint32_t ctx_id,
+diff --git a/src/neptune/npt_ring.c b/src/neptune/npt_ring.c
+index 41eaf3f..6af6310 100644
+--- a/src/neptune/npt_ring.c
++++ b/src/neptune/npt_ring.c
+@@ -327,6 +327,50 @@ npt_ring_relax(uint32_t *iter)
+ #endif
+ }
+ 
++/* BVM-GPU-DIAG: dump the bytes around a decode failure. */
++static void
++npt_ring_dump_failure(const uint8_t *buffer, size_t size, const uint8_t *cur,
++                      uint32_t ring_head)
++{
++   const size_t off = (size_t)(cur - buffer);
++   npt_log("DIAG: batch size=%zu ring_head=%u fail_offset=%zu remaining=%zu",
++           size, ring_head, off, size - off);
++   /* Walk the commands by their cmd_size (24-byte header: type, flags, object_id, cmd_size, reserved)
++    * and print the last few, marking the one that contains the failure. */
++   {
++      size_t pos = 0;
++      size_t starts[512];
++      size_t n = 0;
++      while (pos + 24 <= size && n < 512) {
++         uint32_t csize;
++         memcpy(&csize, buffer + pos + 16, 4);
++         starts[n++] = pos;
++         if (csize < 24 || pos + csize > size)
++            break;
++         pos += csize;
++      }
++      for (size_t k = n > 10 ? n - 10 : 0; k < n; k++) {
++         uint32_t type, flags, csize;
++         uint64_t obj;
++         memcpy(&type, buffer + starts[k], 4);
++         memcpy(&flags, buffer + starts[k] + 4, 4);
++         memcpy(&obj, buffer + starts[k] + 8, 8);
++         memcpy(&csize, buffer + starts[k] + 16, 4);
++         npt_log("DIAG: cmd@%zu type=0x%08x (grp=%u if=%u meth=%u) flags=%u obj=%" PRIu64 " size=%u%s",
++                 starts[k], type, type >> 24, (type >> 8) & 0xffff, type & 0xff, flags, obj, csize,
++                 (starts[k] <= off && off < starts[k] + csize) ? "  <-- failed inside" : "");
++      }
++   }
++   const size_t from = off > 64 ? (off - 64) & ~(size_t)15 : 0;
++   const size_t to = size < off + 64 ? size : off + 64;
++   for (size_t i = from; i < to; i += 16) {
++      char line[16 * 3 + 1] = { 0 };
++      for (size_t j = 0; j < 16 && i + j < size; j++)
++         snprintf(line + j * 3, 4, "%02x ", buffer[i + j]);
++      npt_log("DIAG: %5zu%s %s", i, (i <= off && off < i + 16) ? " <--" : "    ", line);
++   }
++}
++
+ static bool
+ npt_ring_submit_cmd(struct npt_ring *ring,
+                     const uint8_t *buffer,
+@@ -357,6 +401,7 @@ npt_ring_submit_cmd(struct npt_ring *ring,
+       if (!npt_context_dispatch_one_command(ring->context, &ring->dispatch,
+                                             dec, &ring->encoder)) {
+          npt_log("ring_submit_cmd: dispatch failed");
++         npt_ring_dump_failure(buffer, size, dec->cur, ring_head); /* BVM-GPU-DIAG */
+          npt_cs_decoder_reset(dec);
+          return false;
+       }
+diff --git a/src/neptune/npt_shared.c b/src/neptune/npt_shared.c
+index d992e5b..3ab2c83 100644
+--- a/src/neptune/npt_shared.c
++++ b/src/neptune/npt_shared.c
+@@ -212,7 +212,8 @@ npt_shared_export_handle(struct npt_context *ctx, uint64_t blob_id,
+    if (!npt_context_register_pending_blob(ctx, blob_id,
+                                           NPT_SHARED_FD_TYPE, fd,
+                                           export_size,
+-                                          export_virgl_format)) {
++                                          export_virgl_format,
++                                          info.modifier)) {
+       close(fd);
+       return NPT_E_FAIL;
+    }
+diff --git a/src/neptune/npt_transport_defs.h b/src/neptune/npt_transport_defs.h
+index 240e3c2..d739d09 100644
+--- a/src/neptune/npt_transport_defs.h
++++ b/src/neptune/npt_transport_defs.h
+@@ -264,6 +264,10 @@ struct npt_cmd_resource_update {
+     * forces on this struct.  Without it the host body decode (which
+     * excludes the header) under-reads by 4 bytes versus guest sizeof. */
+    uint32_t pad;
++   /* BVM-GPU: the shared npt_protocol_transport.h (protocol commit 0e0c939, the one the Windows driver is built
++    * from) has this field; without it the host under-reads each update by 8 bytes and the ring desyncs.
++    * 0 = immediate context. Non-zero (a deferred context) is not honoured here: the update is applied immediately. */
++   uint64_t context_id;
+    /* followed by `byte_size` bytes of payload */
+ };
+ 
+diff --git a/src/proxy/proxy_context.c b/src/proxy/proxy_context.c
+index c5417db..f7a62e1 100644
+--- a/src/proxy/proxy_context.c
++++ b/src/proxy/proxy_context.c
+@@ -512,6 +512,7 @@ proxy_context_get_blob(struct virgl_context *base,
+       blob->vulkan_info = reply.vulkan_info;
+ 
+    blob->export_format = reply.export_format;
++   blob->export_modifier = reply.export_modifier;
+ 
+    proxy_context_resource_add(ctx, res_id);
+ 
+diff --git a/src/virgl_context.h b/src/virgl_context.h
+index 97c4ea4..fb577b0 100644
+--- a/src/virgl_context.h
++++ b/src/virgl_context.h
+@@ -52,6 +52,10 @@ struct virgl_context_blob {
+     * blob's texture with, or 0 if unknown.  See virgl_resource. */
+    uint32_t export_format;
+ 
++   /* DRM format modifier of a dmabuf the context exported (0 = linear or
++    * unknown).  Needed by the display path to import tiled scanouts. */
++   uint64_t export_modifier;
++
+    struct virgl_resource_vulkan_info vulkan_info;
+ };
+ 
+diff --git a/src/virgl_resource.c b/src/virgl_resource.c
+index 2055527..abe2a4e 100644
+--- a/src/virgl_resource.c
++++ b/src/virgl_resource.c
+@@ -137,7 +137,8 @@ virgl_resource_create_from_fd(uint32_t res_id,
+                               const struct iovec *iov,
+                               int iov_count,
+                               const struct virgl_resource_vulkan_info *vulkan_info,
+-                              uint32_t export_format)
++                              uint32_t export_format,
++                              uint64_t export_modifier)
+ {
+    struct virgl_resource *res;
+ 
+@@ -160,6 +161,7 @@ virgl_resource_create_from_fd(uint32_t res_id,
+       res->vulkan_info = *vulkan_info;
+ 
+    res->export_format = export_format;
++   res->export_modifier = export_modifier;
+ 
+    return res;
+ }
+diff --git a/src/virgl_resource.h b/src/virgl_resource.h
+index 2a68add..ee5c635 100644
+--- a/src/virgl_resource.h
++++ b/src/virgl_resource.h
+@@ -119,6 +119,11 @@ struct virgl_resource {
+     */
+    uint32_t export_format;
+ 
++   /* DRM format modifier of the dmabuf in `fd` as exported by the context
++    * (0 = linear or unknown).  Reported via get_info_ext so a display can
++    * import a tiled scanout correctly. */
++   uint64_t export_modifier;
++
+    void *private_data;
+ };
+ 
+@@ -160,7 +165,8 @@ virgl_resource_create_from_fd(uint32_t res_id,
+                               const struct iovec *iov,
+                               int iov_count,
+                               const struct virgl_resource_vulkan_info *vulkan_info,
+-                              uint32_t export_format);
++                              uint32_t export_format,
++                              uint64_t export_modifier);
+ 
+ struct virgl_resource *
+ virgl_resource_create_from_opaque_handle(struct virgl_context *ctx,
+diff --git a/src/virglrenderer.c b/src/virglrenderer.c
+index 09c204c..34be69e 100644
+--- a/src/virglrenderer.c
++++ b/src/virglrenderer.c
+@@ -575,6 +575,16 @@ int virgl_renderer_resource_get_info_ext(int res_handle,
+ 
+    info_ext->version = VIRGL_RENDERER_RESOURCE_INFO_EXT_VERSION;
+ 
++   /* A blob exported by a context (no pipe resource) carries the dmabuf
++    * modifier the exporter picked; the winsys query below cannot know it. */
++   struct virgl_resource *blob_res = virgl_resource_lookup(res_handle);
++   if (blob_res && !blob_res->pipe_resource && blob_res->fd >= 0) {
++      info_ext->has_dmabuf_export = true;
++      info_ext->planes = 1;
++      info_ext->modifiers = blob_res->export_modifier;
++      return 0;
++   }
++
+    if (state.winsys_initialized) {
+       return vrend_winsys_get_attrs_for_texture(info_ext->base.tex_id,
+                                                 info_ext->base.virgl_format,
+@@ -1255,7 +1265,8 @@ int virgl_renderer_resource_create_blob(const struct virgl_renderer_resource_cre
+                                           args->iovecs,
+                                           args->num_iovs,
+                                           &blob.vulkan_info,
+-                                          blob.export_format);
++                                          blob.export_format,
++                                          blob.export_modifier);
+       if (!res)
+          return -ENOMEM;
+    } else {
+@@ -1520,7 +1531,8 @@ virgl_renderer_resource_import_blob(const struct virgl_renderer_resource_import_
+                                        NULL,
+                                        0,
+                                        NULL,
+-                                       0 /* format not known here */);
++                                       0 /* format not known here */,
++                                       0 /* modifier not known here */);
+    if (!res)
+       return -ENOMEM;
+ 
+diff --git a/src/vrend/vrend_renderer.c b/src/vrend/vrend_renderer.c
+index e6ae007..5621248 100644
+--- a/src/vrend/vrend_renderer.c
++++ b/src/vrend/vrend_renderer.c
+@@ -13935,7 +13935,8 @@ void vrend_renderer_prepare_reset(void)
+ {
+    /* make sure user contexts are no longer accessed */
+    vrend_free_sync_thread();
+-   vrend_hw_switch_context(vrend_state.ctx0, true);
++   if (vrend_state.ctx0)   /* BVMGPU: NULL after a failed reset */
++      vrend_hw_switch_context(vrend_state.ctx0, true);
+ }
+ 
+ void vrend_renderer_reset(void)
+@@ -13943,9 +13944,15 @@ void vrend_renderer_reset(void)
+    vrend_free_fences();
+    vrend_blitter_fini();
+ 
+-   vrend_destroy_context(vrend_state.ctx0);
++   /* BVMGPU: a failed earlier reset (GL context creation failed, ctx0 == NULL) must not crash the next one (SIGSEGV at ctx->sub, README item 155) */
++   if (vrend_state.ctx0)
++      vrend_destroy_context(vrend_state.ctx0);
+ 
+    vrend_state.ctx0 = vrend_create_context(0, strlen("HOST"), "HOST");
++   if (!vrend_state.ctx0) {
++      virgl_error("vrend_renderer_reset: failed to re-create the host context (GL context could not be made current)\n");
++      return;
++   }
+ 
+    if (vrend_state.use_async_fence_cb)
+       vrend_renderer_use_threaded_sync();

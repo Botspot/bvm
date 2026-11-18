@@ -1,0 +1,3371 @@
+diff --git a/src/d3d11/d3d11_context.cpp b/src/d3d11/d3d11_context.cpp
+index e2188eb5..237046ab 100644
+--- a/src/d3d11/d3d11_context.cpp
++++ b/src/d3d11/d3d11_context.cpp
+@@ -6,6 +6,23 @@
+ 
+ namespace dxvk {
+ 
++  // V3D is a tiler: DiscardView becomes loadOp DONT_CARE and tiles the following
++  // partial redraw does not cover are lost, but D2D/XAML/DComp rely on the rest of
++  // the target surviving a discard (desktop GPUs keep it). Ignore discards of color
++  // targets by default; depth/stencil and buffer discards are unchanged.
++  // BVM_DXVK_KEEPDISCARD=1 restores upstream behavior, BVM_DXVK_NODISCARD=1 also
++  // ignores depth/stencil discards.
++  static bool bvmEnvFlag(const char* name) {
++    const char* e = getenv(name);
++    return e && *e && *e != '0';
++  }
++
++  static bool bvmIgnoreDiscard(bool color) {
++    static const bool keep = bvmEnvFlag("BVM_DXVK_KEEPDISCARD");
++    static const bool all  = bvmEnvFlag("BVM_DXVK_NODISCARD");
++    return !keep && (color || all);
++  }
++
+   template<typename ContextType>
+   D3D11CommonContext<ContextType>::D3D11CommonContext(
+           D3D11Device*            pParent,
+@@ -142,6 +159,10 @@ namespace dxvk {
+       auto texture = GetCommonTexture(pResource);
+       auto image = texture->GetImage();
+ 
++      if (image && bvmIgnoreDiscard(!(image->formatInfo()->aspectMask
++          & (VK_IMAGE_ASPECT_DEPTH_BIT | VK_IMAGE_ASPECT_STENCIL_BIT))))
++        return;
++
+       for (uint32_t i = 0; i < texture->CountSubresources(); i++)
+         DiscardTexture(pResource, i);
+ 
+@@ -183,6 +204,10 @@ namespace dxvk {
+     // ID3D11View has no methods to query the exact type of
+     // the view, so we'll have to check each possible class
+     auto dsv = dynamic_cast<D3D11DepthStencilView*>(pResourceView);
++
++    if (bvmIgnoreDiscard(!dsv))
++      return;
++
+     auto rtv = dynamic_cast<D3D11RenderTargetView*>(pResourceView);
+     auto uav = dynamic_cast<D3D11UnorderedAccessView*>(pResourceView);
+ 
+diff --git a/src/d3d11/d3d11_features.cpp b/src/d3d11/d3d11_features.cpp
+index ee7cafa8..7aac60d6 100644
+--- a/src/d3d11/d3d11_features.cpp
++++ b/src/d3d11/d3d11_features.cpp
+@@ -192,8 +192,8 @@ namespace dxvk {
+     // Check Feature Level 11_0 features
+     if (!features.core.features.drawIndirectFirstInstance
+      || !features.core.features.fragmentStoresAndAtomics
+-     || !features.core.features.multiDrawIndirect
+-     || !features.core.features.tessellationShader)
++     || false /* BVM-GPU: V3D hw supports it, V3DV flag is false */
++     || false /* BVM-GPU: no tessellation on V3D; HS/DS pipelines will fail */)
+       return D3D_FEATURE_LEVEL_10_1;
+ 
+     // Check Feature Level 11_1 features
+diff --git a/src/d3d11/d3d11_sampler.cpp b/src/d3d11/d3d11_sampler.cpp
+index fbe38f4a..11653054 100644
+--- a/src/d3d11/d3d11_sampler.cpp
++++ b/src/d3d11/d3d11_sampler.cpp
+@@ -50,6 +50,39 @@ namespace dxvk {
+       DecodeAddressMode(desc.AddressV),
+       DecodeAddressMode(desc.AddressW));
+ 
++    // BVMDIAG: BVM_DXVK_SAMPLER0=repeat turns the D3D11 default sampler (linear, all CLAMP, MinLOD=-FLT_MAX), which sits at sampler
++    // heap index 0, into a REPEAT sampler. V3DV ignores the dynamic sampler index, so if every draw ends up using heap[0] the tiling bug
++    // disappears with this switch on. Diagnostic only: it breaks clamping everywhere that uses the default sampler.
++    static const bool bvmSampler0Repeat = [] {
++      const char* e = std::getenv("BVM_DXVK_SAMPLER0");
++      return e && std::string(e) == "repeat";
++    }();
++
++    if (bvmSampler0Repeat && uint32_t(desc.Filter) == 21u && desc.MinLOD < -1e30f
++     && desc.AddressU == D3D11_TEXTURE_ADDRESS_CLAMP && desc.AddressV == D3D11_TEXTURE_ADDRESS_CLAMP
++     && desc.AddressW == D3D11_TEXTURE_ADDRESS_CLAMP) {
++      info.setAddressModes(VK_SAMPLER_ADDRESS_MODE_REPEAT, VK_SAMPLER_ADDRESS_MODE_REPEAT, VK_SAMPLER_ADDRESS_MODE_REPEAT);
++    }
++
++    // BVMDIAG: BVM_DXVK_SAMPLER_ALL=repeat|clamp forces the address mode of EVERY sampler (border modes are left alone).
++    // repeat: if the tiling test page then tiles, wrap works in hardware and the wrong sampler is being selected;
++    // if it still shows stripes, the problem is on the texture side.
++    static const int bvmSamplerAll = [] {
++      const char* e = std::getenv("BVM_DXVK_SAMPLER_ALL");
++      if (!e) return 0;
++      if (std::string(e) == "repeat") return 1;
++      if (std::string(e) == "clamp") return 2;
++      return 0;
++    }();
++
++    if (bvmSamplerAll) {
++      VkSamplerAddressMode forced = bvmSamplerAll == 1 ? VK_SAMPLER_ADDRESS_MODE_REPEAT : VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
++      auto pick = [forced] (D3D11_TEXTURE_ADDRESS_MODE m) {
++        return m == D3D11_TEXTURE_ADDRESS_BORDER ? VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_BORDER : forced;
++      };
++      info.setAddressModes(pick(desc.AddressU), pick(desc.AddressV), pick(desc.AddressW));
++    }
++
+     info.setDepthCompare((filterBits & 0x180) == 0x80,
+       DecodeCompareOp(desc.ComparisonFunc));
+ 
+@@ -58,7 +91,23 @@ namespace dxvk {
+     for (uint32_t i = 0; i < 4; i++)
+       info.borderColor.float32[i] = desc.BorderColor[i];
+ 
++    // BVMDIAG: BVM_DXVK_SAMPLERLOG=1 logs every sampler state: D3D11 desc (address modes 1=WRAP 2=MIRROR 3=CLAMP 4=BORDER
++    // 5=MIRROR_ONCE) and the Vulkan address modes it was translated to (0=REPEAT 1=MIRRORED_REPEAT 2=CLAMP_TO_EDGE 3=CLAMP_TO_BORDER).
++    static const bool bvmSamplerLog = [] {
++      const char* e = std::getenv("BVM_DXVK_SAMPLERLOG");
++      return e && *e && *e != '0';
++    }();
++
+     m_sampler = device->GetDXVKDevice()->createSampler(info);
++
++    if (bvmSamplerLog) {
++      Logger::info(str::format("BVMSAMPLER: heapIndex=", uint32_t(m_sampler->getDescriptor().samplerIndex),
++        " filter=", uint32_t(desc.Filter),
++        " addrU=", uint32_t(desc.AddressU), " addrV=", uint32_t(desc.AddressV), " addrW=", uint32_t(desc.AddressW),
++        " -> vk U=", uint32_t(info.u.p.addressU), " V=", uint32_t(info.u.p.addressV), " W=", uint32_t(info.u.p.addressW),
++        " lodBias=", lodBias, " minLod=", desc.MinLOD, " maxLod=", desc.MaxLOD, " aniso=", anisotropy,
++        " cmp=", uint32_t(desc.ComparisonFunc)));
++    }
+   }
+ 
+ 
+diff --git a/src/dxvk/dxvk_cmdlist.h b/src/dxvk/dxvk_cmdlist.h
+index 97989f68..27c594bc 100644
+--- a/src/dxvk/dxvk_cmdlist.h
++++ b/src/dxvk/dxvk_cmdlist.h
+@@ -602,7 +602,18 @@ namespace dxvk {
+     void cmdBindDescriptorSets(
+             DxvkCmdBuffer             cmdBuffer,
+       const VkBindDescriptorSetsInfo* info) {
+-      m_vkd->vkCmdBindDescriptorSets2KHR(getCmdBuffer(cmdBuffer), info);
++      if (m_vkd->vkCmdBindDescriptorSets2KHR) {
++        m_vkd->vkCmdBindDescriptorSets2KHR(getCmdBuffer(cmdBuffer), info);
++        return;
++      }
++
++      // VK_KHR_maintenance6 is unavailable (e.g. V3DV): use the core entry point
++      if (info->stageFlags & VK_SHADER_STAGE_ALL_GRAPHICS)
++        m_vkd->vkCmdBindDescriptorSets(getCmdBuffer(cmdBuffer), VK_PIPELINE_BIND_POINT_GRAPHICS,
++          info->layout, info->firstSet, info->descriptorSetCount, info->pDescriptorSets, 0, nullptr);
++      if (info->stageFlags & VK_SHADER_STAGE_COMPUTE_BIT)
++        m_vkd->vkCmdBindDescriptorSets(getCmdBuffer(cmdBuffer), VK_PIPELINE_BIND_POINT_COMPUTE,
++          info->layout, info->firstSet, info->descriptorSetCount, info->pDescriptorSets, 0, nullptr);
+     }
+ 
+ 
+@@ -944,7 +955,14 @@ namespace dxvk {
+     void cmdPushConstants(
+             DxvkCmdBuffer           cmdBuffer,
+       const VkPushConstantsInfo*    info) {
+-      m_vkd->vkCmdPushConstants2KHR(getCmdBuffer(cmdBuffer), info);
++      if (m_vkd->vkCmdPushConstants2KHR) {
++        m_vkd->vkCmdPushConstants2KHR(getCmdBuffer(cmdBuffer), info);
++        return;
++      }
++
++      // VK_KHR_maintenance6 is unavailable (e.g. V3DV): use the core entry point
++      m_vkd->vkCmdPushConstants(getCmdBuffer(cmdBuffer), info->layout,
++        info->stageFlags, info->offset, info->size, info->pValues);
+     }
+ 
+ 
+diff --git a/src/dxvk/dxvk_context.cpp b/src/dxvk/dxvk_context.cpp
+index 97aee058..46e940c2 100644
+--- a/src/dxvk/dxvk_context.cpp
++++ b/src/dxvk/dxvk_context.cpp
+@@ -1,15 +1,112 @@
+ #include <algorithm>
++#include <atomic>
+ #include <cmath>
+ #include <cstring>
+ #include <map>
++#include <mutex>
++#include <set>
++#include <string>
+ #include <vector>
+ #include <utility>
+ 
++#include <cstdarg>
++#include <cstdint>
++#include <cstdio>
++#include <cstdlib>
++#include <time.h>
++#include <unistd.h>
++#if defined(__linux__)
++#include <dlfcn.h>
++#include <execinfo.h>
++#endif
++
++// BVMDIAG: BVM_DXVK_PASSLOG=1 pass/clear/draw logging helpers
++static inline bool bvmPassLogEnabled() {
++  static const bool enabled = [] {
++    const char* e = getenv("BVM_DXVK_PASSLOG");
++    return e && *e && *e != '0';
++  }();
++  return enabled;
++}
++
++static thread_local uint32_t g_bvmDraws = 0;
++static thread_local char g_bvmFirst[224] = "";
++
++static inline unsigned long long bvmNowUs() {
++  struct timespec ts;
++  clock_gettime(CLOCK_MONOTONIC, &ts);
++  return (unsigned long long)ts.tv_sec * 1000000ull + ts.tv_nsec / 1000;
++}
++
++// BVMDIAG: draws skipped because the pipeline failed to compile (tessellation
++// on V3D). Prints a per-5-second summary when BVM_DXVK_PASSLOG=1.
++static void bvmNoteSkippedDraw() {
++  if (!bvmPassLogEnabled())
++    return;
++
++  static std::atomic<uint32_t> count = { 0u };
++  static std::atomic<unsigned long long> lastUs = { 0ull };
++
++  count.fetch_add(1u);
++
++  unsigned long long now = bvmNowUs();
++  unsigned long long last = lastUs.load();
++
++  if (!last) {
++    lastUs.compare_exchange_strong(last, now);
++  } else if (now - last >= 5000000ull && lastUs.compare_exchange_strong(last, now)) {
++    fprintf(stderr, "BVMSKIP t_us=%llu pid=%d skipped_draws_last_5s=%u\n",
++      now, (int)getpid(), count.exchange(0u));
++  }
++}
++
+ #include "dxvk_device.h"
+ #include "dxvk_context.h"
++#include "dxvk_tessemu.h"
+ 
+ namespace dxvk {
+-  
++
++  // BVMDIAG: BVM_DXVK_PASSLOG=1 image operation trace. One line per operation
++  // that writes, discards, replaces the storage of, or reads back an image:
++  //   BVMOP t_us= pid= op= img=<ptr low bits> WxHxD mips layers fmt= usage= <extra>
++  // Lets one UI surface be followed through its whole lifetime in the log.
++  static void bvmOp(const char* op, const DxvkImage* image, const char* extraFmt = "", ...) {
++    if (!bvmPassLogEnabled() || !image)
++      return;
++
++    char extra[256];
++    va_list args;
++    va_start(args, extraFmt);
++    vsnprintf(extra, sizeof(extra), extraFmt, args);
++    va_end(args);
++
++    const auto& i = image->info();
++    fprintf(stderr, "BVMOP t_us=%llu pid=%d %s img=%05lx %ux%ux%u m%u l%u fmt=%d usage=%x %s\n",
++      bvmNowUs(), (int)getpid(), op, (unsigned long)((uintptr_t(image) >> 4) & 0xfffff),
++      i.extent.width, i.extent.height, i.extent.depth, i.mipLevels, i.numLayers,
++      int(i.format), unsigned(i.usage), extra);
++  }
++
++  // Number of non-zero bytes in the first part of a CPU-visible buffer range
++  static int bvmNonZero(const DxvkBuffer* buffer, VkDeviceSize offset) {
++    if (!buffer || !buffer->mapPtr(0))
++      return -1;
++
++    VkDeviceSize size = buffer->info().size;
++
++    if (offset >= size)
++      return -1;
++
++    const uint8_t* p = reinterpret_cast<const uint8_t*>(buffer->mapPtr(offset));
++    size_t n = size_t(std::min<VkDeviceSize>(size - offset, 4096u));
++    int nz = 0;
++
++    for (size_t k = 0u; k < n; k++)
++      nz += p[k] != 0;
++
++    return nz;
++  }
++
+   DxvkContext::DxvkContext(const Rc<DxvkDevice>& device)
+   : m_device      (device),
+     m_common      (&device->m_objects),
+@@ -193,6 +290,9 @@ namespace dxvk {
+     const Rc<DxvkImageView>&    srcView,
+     const VkOffset3D*           srcOffsets,
+           VkFilter              filter) {
++    bvmOp("blit-dst", dstView->image(), "dst=%d,%d..%d,%d", dstOffsets[0].x, dstOffsets[0].y, dstOffsets[1].x, dstOffsets[1].y);
++    bvmOp("blit-src", srcView->image(), "src=%d,%d..%d,%d", srcOffsets[0].x, srcOffsets[0].y, srcOffsets[1].x, srcOffsets[1].y);
++
+     this->endCurrentPass(true);
+ 
+     auto mapping = util::resolveSrcComponentMapping(
+@@ -329,6 +429,11 @@ namespace dxvk {
+           VkImageAspectFlags    clearAspects,
+           VkClearValue          clearValue,
+           VkImageAspectFlags    discardAspects) {
++    bvmOp("clearRT", imageView->image(), "aspects=%x discard=%x val=%g,%g,%g,%g fullsize=%d",
++      unsigned(clearAspects), unsigned(discardAspects),
++      clearValue.color.float32[0], clearValue.color.float32[1], clearValue.color.float32[2], clearValue.color.float32[3],
++      int(m_state.om.framebufferInfo.isFullSize(imageView)));
++
+     // Make sure the color components are ordered correctly
+     if (clearAspects & VK_IMAGE_ASPECT_COLOR_BIT) {
+       clearValue.color = util::swizzleClearColor(clearValue.color,
+@@ -384,6 +489,10 @@ namespace dxvk {
+           VkExtent3D            extent,
+           VkImageAspectFlags    aspect,
+           VkClearValue          value) {
++    bvmOp("clearView", imageView->image(), "off=%d,%d ext=%ux%u aspect=%x val=%g,%g,%g,%g",
++      offset.x, offset.y, extent.width, extent.height, unsigned(aspect),
++      value.color.float32[0], value.color.float32[1], value.color.float32[2], value.color.float32[3]);
++
+     const VkImageUsageFlags viewUsage = imageView->info().usage;
+ 
+     if (aspect & VK_IMAGE_ASPECT_COLOR_BIT) {
+@@ -481,6 +590,10 @@ namespace dxvk {
+           VkDeviceSize          rowAlignment,
+           VkDeviceSize          sliceAlignment,
+           VkFormat              srcFormat) {
++    bvmOp("upload", dstImage.ptr(), "mip=%u layer=%u off=%d,%d ext=%ux%u srcbuf_nonzero4k=%d srcfmt=%d",
++      dstSubresource.mipLevel, dstSubresource.baseArrayLayer, dstOffset.x, dstOffset.y,
++      dstExtent.width, dstExtent.height, bvmNonZero(srcBuffer.ptr(), srcOffset), int(srcFormat));
++
+     bool useFb = !formatsAreBufferCopyCompatible(dstImage->info().format, srcFormat)
+               || dstImage->info().sampleCount != VK_SAMPLE_COUNT_1_BIT;
+ 
+@@ -503,12 +616,34 @@ namespace dxvk {
+           VkImageSubresourceLayers srcSubresource,
+           VkOffset3D            srcOffset,
+           VkExtent3D            extent) {
++    bvmOp("copy-dst", dstImage.ptr(), "mip=%u layer=%u off=%d,%d ext=%ux%u",
++      dstSubresource.mipLevel, dstSubresource.baseArrayLayer, dstOffset.x, dstOffset.y, extent.width, extent.height);
++    bvmOp("copy-src", srcImage.ptr(), "mip=%u layer=%u off=%d,%d ext=%ux%u",
++      srcSubresource.mipLevel, srcSubresource.baseArrayLayer, srcOffset.x, srcOffset.y, extent.width, extent.height);
++
+     if (this->copyImageClear(dstImage, dstSubresource, dstOffset, extent, srcImage, srcSubresource)
+      || this->copyImageInline(*dstImage, dstSubresource, dstOffset, *srcImage, srcSubresource, srcOffset, extent))
+       return;
+ 
+     bool useFb = !formatsAreImageCopyCompatible(dstImage->info().format, srcImage->info().format);
+ 
++    // BVMDIAG: BVM_DXVK_COPYFB=1 copies 2D color images with a draw instead of
++    // vkCmdCopyImage (V3DV copy path suspected of leaving black strips).
++    static const bool bvmForceFbCopy = [] {
++      const char* e = getenv("BVM_DXVK_COPYFB");
++      return e && *e && *e != '0';
++    }();
++
++    if (bvmForceFbCopy
++     && dstSubresource.aspectMask == VK_IMAGE_ASPECT_COLOR_BIT
++     && srcSubresource.aspectMask == VK_IMAGE_ASPECT_COLOR_BIT
++     && dstImage->info().type == VK_IMAGE_TYPE_2D
++     && srcImage->info().type == VK_IMAGE_TYPE_2D
++     && dstImage->info().sampleCount == VK_SAMPLE_COUNT_1_BIT
++     && srcImage->info().sampleCount == VK_SAMPLE_COUNT_1_BIT
++     && dstImage != srcImage)
++      useFb = true;
++
+     if (m_device->perfHints().preferFbDepthStencilCopy) {
+       useFb |= (dstSubresource.aspectMask == (VK_IMAGE_ASPECT_DEPTH_BIT | VK_IMAGE_ASPECT_STENCIL_BIT))
+             && (dstImage->info().usage & VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT)
+@@ -539,6 +674,10 @@ namespace dxvk {
+           VkOffset3D            dstOffset,
+           VkOffset3D            srcOffset,
+           VkExtent3D            extent) {
++    bvmOp("copyRegion", dstImage.ptr(), "mip=%u layer=%u dst=%d,%d src=%d,%d ext=%ux%u",
++      dstSubresource.mipLevel, dstSubresource.baseArrayLayer, dstOffset.x, dstOffset.y, srcOffset.x, srcOffset.y,
++      extent.width, extent.height);
++
+     VkOffset3D loOvl = {
+       std::max(dstOffset.x, srcOffset.x),
+       std::max(dstOffset.y, srcOffset.y),
+@@ -610,6 +749,9 @@ namespace dxvk {
+           VkImageSubresourceLayers srcSubresource,
+           VkOffset3D            srcOffset,
+           VkExtent3D            srcExtent) {
++    bvmOp("readback", srcImage.ptr(), "mip=%u layer=%u off=%d,%d ext=%ux%u",
++      srcSubresource.mipLevel, srcSubresource.baseArrayLayer, srcOffset.x, srcOffset.y, srcExtent.width, srcExtent.height);
++
+     bool useFb = !formatsAreBufferCopyCompatible(srcImage->info().format, dstFormat);
+ 
+     if (useFb) {
+@@ -788,6 +930,8 @@ namespace dxvk {
+ 
+   void DxvkContext::discardImage(
+     const Rc<DxvkImage>&          image) {
++    bvmOp("discard", image.ptr());
++
+     VkImageUsageFlags imageUsage = image->info().usage;
+ 
+     if (!(imageUsage & (VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT)))
+@@ -1354,6 +1498,8 @@ namespace dxvk {
+           Rc<DxvkResourceAllocation>&& slice,
+     const DxvkImageUsageInfo&       usageInfo,
+           VkImageLayout             layout) {
++    bvmOp("invalidate(new storage)", image.ptr());
++
+     VkImageUsageFlags usage = image->info().usage;
+ 
+     // Invalidate active image descriptors
+@@ -1562,7 +1708,154 @@ namespace dxvk {
+   void DxvkContext::drawGeneric(
+           uint32_t                  count,
+     const T*                        draws) {
++    // BVM: V3D has no tessellation, run those stages on lavapipe instead
++    if (unlikely(m_state.gp.shaders.tes != nullptr)
++     && !m_device->features().core.features.tessellationShader) {
++      for (uint32_t i = 0u; i < count; i++) {
++        bool done;
++
++        if constexpr (Indexed) {
++          done = this->bvmTessEmuDraw(true, draws[i].indexCount, draws[i].instanceCount,
++            draws[i].firstIndex, draws[i].vertexOffset, draws[i].firstInstance);
++        } else {
++          done = this->bvmTessEmuDraw(false, draws[i].vertexCount, draws[i].instanceCount,
++            draws[i].firstVertex, 0, draws[i].firstInstance);
++        }
++
++        if (!done)
++          bvmNoteSkippedDraw();
++      }
++
++      return;
++    }
++
++    // BVM: forced sample count on a single-sampled target (Direct2D coverage
++    // masks, ForcedSampleCount=16 + SV_Coverage). V3D cannot rasterize 16
++    // samples, so draw once per sample position with the viewport shifted by
++    // the negative sample offset, and let the pixel shader report that
++    // sample's bit (built-in push data bits 16..31). XOR logic ops, blending
++    // etc. then accumulate the bits exactly like the per-sample hardware would.
++    // BVM_DXVK_NOCOVERAGE=1 disables.
++    if (unlikely(!m_bvmCoverageLoop)
++     && unlikely(m_state.gp.state.rs.sampleCount() > 1u)
++     && m_state.gp.state.ms.sampleCount() <= 1u
++     && m_state.gp.shaders.fs != nullptr
++     && m_state.gp.shaders.fs->metadata().flags.test(DxvkShaderFlag::ReadsSampleMaskInput)) {
++      static const bool disabled = [] {
++        const char* e = getenv("BVM_DXVK_NOCOVERAGE");
++        return e && *e && *e != '0';
++      }();
++
++      // D3D11 standard sample positions in 1/16 pixel units, relative to the pixel center
++      static const int8_t s_pos2[2][2]   = {{ 4, 4 }, { -4, -4 }};
++      static const int8_t s_pos4[4][2]   = {{ -2, -6 }, { 6, -2 }, { -6, 2 }, { 2, 6 }};
++      static const int8_t s_pos8[8][2]   = {{ 1, -3 }, { -1, 3 }, { 5, 1 }, { -3, -5 },
++                                            { -5, 5 }, { -7, -1 }, { 3, 7 }, { 7, -7 }};
++      static const int8_t s_pos16[16][2] = {{ 1, 1 }, { -1, -3 }, { -3, 2 }, { 4, -1 },
++                                            { -5, -2 }, { 2, 5 }, { 5, 3 }, { 3, -5 },
++                                            { -2, 6 }, { 0, 7 }, { -4, -6 }, { -6, 4 },
++                                            { -8, 0 }, { 7, -4 }, { 6, -7 }, { -7, -8 }};
++
++      uint32_t n = uint32_t(m_state.gp.state.rs.sampleCount());
++      const int8_t (*pos)[2] = nullptr;
++
++      switch (n) {
++        case 2u:  pos = s_pos2;  break;
++        case 4u:  pos = s_pos4;  break;
++        case 8u:  pos = s_pos8;  break;
++        case 16u: pos = s_pos16; break;
++        default: break;
++      }
++
++      if (pos && !disabled) {
++        std::array<VkViewport, DxvkLimits::MaxNumViewports> savedViewports;
++        uint32_t viewportCount = m_state.vp.viewportCount;
++
++        for (uint32_t i = 0u; i < viewportCount; i++)
++          savedViewports[i] = m_state.vp.viewports[i];
++
++        uint32_t savedBuiltIns;
++        uint32_t builtInsOffset = computePushDataBlockOffset(DxvkPushDataBlock::computeIndex(VK_SHADER_STAGE_ALL_GRAPHICS));
++        std::memcpy(&savedBuiltIns, &m_state.pc.constantData[builtInsOffset], sizeof(savedBuiltIns));
++
++        m_bvmCoverageLoop = true;
++
++        for (uint32_t k = 0u; k < n; k++) {
++          for (uint32_t i = 0u; i < viewportCount; i++) {
++            m_state.vp.viewports[i] = savedViewports[i];
++            m_state.vp.viewports[i].x -= float(pos[k][0]) / 16.0f;
++            m_state.vp.viewports[i].y -= float(pos[k][1]) / 16.0f;
++          }
++
++          uint32_t builtIns = (savedBuiltIns & ~(((1u << DxvkBuiltInPushData::ForcedCoverageBits) - 1u)
++            << DxvkBuiltInPushData::ForcedCoverageOffset)) | (1u << (k + DxvkBuiltInPushData::ForcedCoverageOffset));
++
++          m_flags.set(DxvkContextFlag::GpDirtyViewport);
++          this->pushData(VK_SHADER_STAGE_ALL_GRAPHICS, 0u, sizeof(builtIns), &builtIns);
++          this->drawGeneric<Indexed, T>(count, draws);
++        }
++
++        m_bvmCoverageLoop = false;
++
++        for (uint32_t i = 0u; i < viewportCount; i++)
++          m_state.vp.viewports[i] = savedViewports[i];
++
++        m_flags.set(DxvkContextFlag::GpDirtyViewport);
++        this->pushData(VK_SHADER_STAGE_ALL_GRAPHICS, 0u, sizeof(savedBuiltIns), &savedBuiltIns);
++        return;
++      }
++    }
++
+     if (this->commitGraphicsState<Indexed, false>()) {
++      if (!g_bvmDraws) {
++        // BVMDIAG: remember the first draw of the pass
++        const auto& b0 = m_state.gp.state.omBlend[0];
++        uint32_t n;
++        if constexpr (Indexed) n = draws->indexCount; else n = draws->vertexCount;
++        std::string fsName, vsName;
++        if (bvmPassLogEnabled()) {
++          const auto& sh = m_state.gp.shaders;
++          if (sh.fs) fsName = sh.fs->debugName().substr(0, 11);
++          if (sh.vs) vsName = sh.vs->debugName().substr(0, 11);
++        }
++        snprintf(g_bvmFirst, sizeof(g_bvmFirst), "n=%u inst=%u blend=%u wm=%x idx=%d cnt=%u vs=%s fs=%s",
++          n, draws->instanceCount, (unsigned)b0.blendEnable(),
++          (unsigned)b0.colorWriteMask(), Indexed ? 1 : 0, count, vsName.c_str(), fsName.c_str());
++      }
++      if (bvmPassLogEnabled()) {
++        // BVMDIAG: one line per draw: target, viewport/scissor, blend, bound textures
++        const auto& sh = m_state.gp.shaders;
++        const auto& rtv = m_state.om.renderTargets.color[0].view;
++        const auto& vp0 = m_state.vp.viewports[0];
++        const auto& sc0 = m_state.vp.scissorRects[0];
++        const auto& b0 = m_state.gp.state.omBlend[0];
++        uint32_t n;
++        if constexpr (Indexed) n = draws->indexCount; else n = draws->vertexCount;
++        char tex[192] = "";
++        size_t tl = 0;
++        int shown = 0;
++        for (uint32_t s = 0; s < m_resources.size() && shown < 4; s++) {
++          const auto& v = m_resources[s].imageView;
++          if (!v || !(v->image()->info().usage & VK_IMAGE_USAGE_SAMPLED_BIT))
++            continue;
++          const auto& ii = v->image()->info();
++          tl += snprintf(tex + tl, sizeof(tex) - tl, " s%u=%05lx(%ux%u)", s,
++            (unsigned long)((uintptr_t(v->image()) >> 4) & 0xfffff), ii.extent.width, ii.extent.height);
++          shown++;
++          if (tl >= sizeof(tex) - 40) break;
++        }
++        fprintf(stderr, "BVMDRAW t_us=%llu pid=%d rt=%05lx(%ux%u) vs=%s fs=%s n=%u inst=%u vp=%g,%g %gx%g sc=%d,%d %ux%u blend=%d src=%d dst=%d wm=%x tex:%s\n",
++          bvmNowUs(), (int)getpid(),
++          rtv ? (unsigned long)((uintptr_t(rtv->image()) >> 4) & 0xfffff) : 0ul,
++          rtv ? rtv->image()->info().extent.width : 0u, rtv ? rtv->image()->info().extent.height : 0u,
++          sh.vs ? sh.vs->debugName().substr(0, 11).c_str() : "-",
++          sh.fs ? sh.fs->debugName().substr(0, 11).c_str() : "-",
++          n, draws->instanceCount, vp0.x, vp0.y, vp0.width, vp0.height,
++          sc0.offset.x, sc0.offset.y, sc0.extent.width, sc0.extent.height,
++          int(b0.blendEnable()), int(b0.srcColorBlendFactor()), int(b0.dstColorBlendFactor()),
++          unsigned(b0.colorWriteMask()), tex);
++      }
++      g_bvmDraws++;
+       if (count == 1u) {
+         // Most common case, just emit a single draw
+         if constexpr (Indexed) {
+@@ -1781,6 +2074,9 @@ namespace dxvk {
+           VkFormat                  format,
+           VkResolveModeFlagBits     mode,
+           VkResolveModeFlagBits     stencilMode) {
++    bvmOp("resolve-dst", dstImage.ptr());
++    bvmOp("resolve-src", srcImage.ptr());
++
+     auto formatInfo = lookupFormatInfo(format);
+ 
+     // Normalize resolve modes to available subresources
+@@ -2080,6 +2376,12 @@ namespace dxvk {
+         renderingInfo.pColorAttachments = &attachmentInfo;
+       }
+ 
++      if (bvmPassLogEnabled())
++        fprintf(stderr, "BVMCLEAR t_us=%llu pid=%d %ux%u fmt=%d aspects=0x%x clear=0x%x discard=0x%x buf=%d\n",
++          bvmNowUs(), (int)getpid(), extent.width, extent.height,
++          (int)entry.view->info().format, (unsigned)entry.view->info().aspects,
++          (unsigned)entry.clearAspects, (unsigned)entry.discardAspects, (int)cmdBuffer);
++
+       m_cmd->cmdBeginRendering(cmdBuffer, &renderingInfo);
+ 
+       if (useLateClear) {
+@@ -2826,6 +3128,7 @@ namespace dxvk {
+      || !m_state.dyn.depthStencilState.stencilOpBack().eq(ds.stencilOpBack()))
+       m_flags.set(DxvkContextFlag::GpDirtyStencilTest);
+ 
++
+     m_state.dyn.depthStencilState = ds;
+   }
+   
+@@ -4310,10 +4613,24 @@ namespace dxvk {
+       copyInfo.pRegions = &copyRegion;
+ 
+       m_cmd->cmdCopyImage(cmdBuffer, &copyInfo);
++
++      // BVMDIAG: BVM_DXVK_COPYSYNC=1 adds a full memory barrier after every image
++      // copy, so V3DV serializes consecutive copy jobs (partial-tile loads of a
++      // tile that the previous copy stored are suspected of reading stale data).
++      static const bool bvmCopySync = [] {
++        const char* e = getenv("BVM_DXVK_COPYSYNC");
++        return e && *e && *e != '0';
++      }();
++
++      if (bvmCopySync) {
++        accessMemory(cmdBuffer,
++          VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT, VK_ACCESS_2_MEMORY_WRITE_BIT,
++          VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT, VK_ACCESS_2_MEMORY_READ_BIT | VK_ACCESS_2_MEMORY_WRITE_BIT);
++      }
+     }
+   }
+ 
+-  
++
+   void DxvkContext::copyImageFb(
+     const Rc<DxvkImage>&        dstImage,
+           VkImageSubresourceLayers dstSubresource,
+@@ -5958,8 +6275,33 @@ namespace dxvk {
+   }
+ 
+ 
++  static void bvmLogPassBegin(const DxvkFramebufferInfo& fb);
++
++
+   void DxvkContext::beginRenderPass() {
+     if (!m_flags.test(DxvkContextFlag::GpRenderPassActive)) {
++      bvmLogPassBegin(m_state.om.framebufferInfo);
++
++      if (bvmPassLogEnabled()) {
++        const auto& rt = m_state.om.renderTargets;
++
++        for (uint32_t i = 0u; i < MaxNumRenderTargets; i++) {
++          if (!rt.color[i].view)
++            continue;
++
++          const auto& ops = m_state.om.renderPassOps.colorOps[i];
++          bvmOp("pass-color", rt.color[i].view->image(), "rt=%u load=%d(0=load,1=clear,2=dontcare) clear=%g,%g,%g,%g viewmip=%u layer=%u",
++            i, int(ops.loadOp), ops.clearValue.float32[0], ops.clearValue.float32[1], ops.clearValue.float32[2], ops.clearValue.float32[3],
++            rt.color[i].view->imageSubresources().baseMipLevel, rt.color[i].view->imageSubresources().baseArrayLayer);
++        }
++
++        if (rt.depth.view) {
++          const auto& ops = m_state.om.renderPassOps.depthOps;
++          bvmOp("pass-depth", rt.depth.view->image(), "loadD=%d loadS=%d",
++            int(ops.loadOpD), int(ops.loadOpS));
++        }
++      }
++
+       if (unlikely(m_features.test(DxvkContextFeature::DebugUtils)))
+         popDebugRegion(util::DxvkDebugLabelType::InternalBarrierControl);
+ 
+@@ -6011,8 +6353,76 @@ namespace dxvk {
+   }
+   
+   
++  // BVMDIAG: BVM_DXVK_PASSLOG=1 logs who begins each render pass
++  static void bvmLogPassBegin(const DxvkFramebufferInfo& fb) {
++#if defined(__linux__)
++    if (!bvmPassLogEnabled())
++      return;
++
++    void* bt[10];
++    int n = backtrace(bt, 10);
++    char line[512];
++    int o = 0;
++    DxvkFramebufferSize ext = fb.size();
++    o += snprintf(line + o, sizeof(line) - o,
++      "BVMBEGIN t_us=%llu pid=%d %ux%u bt=",
++      bvmNowUs(), (int)getpid(), ext.width, ext.height);
++    for (int i = 1; i < n && o < (int)sizeof(line) - 40; i++) {
++      Dl_info di;
++      if (dladdr(bt[i], &di) && di.dli_fbase)
++        o += snprintf(line + o, sizeof(line) - o, "%s%lx",
++          i > 1 ? "," : "", (unsigned long)((char*)bt[i] - (char*)di.dli_fbase));
++    }
++    fprintf(stderr, "%s\n", line);
++#endif
++  }
++
++
++  // BVMDIAG: BVM_DXVK_PASSLOG=1 logs who ends each render pass
++  static void bvmLogPassEnd(bool suspend, const DxvkFramebufferInfo& fb) {
++#if defined(__linux__)
++    if (!bvmPassLogEnabled())
++      return;
++
++    void* bt[10];
++    int n = backtrace(bt, 10);
++    char line[512];
++    int o = 0;
++    DxvkFramebufferSize ext = fb.size();
++    o += snprintf(line + o, sizeof(line) - o,
++      "BVMPASS t_us=%llu pid=%d susp=%d %ux%u draws=%u first=[%s] bt=",
++      bvmNowUs(), (int)getpid(), suspend ? 1 : 0, ext.width, ext.height,
++      g_bvmDraws, g_bvmFirst);
++    g_bvmDraws = 0;
++    g_bvmFirst[0] = 0;
++    for (int i = 1; i < n && o < (int)sizeof(line) - 40; i++) {
++      Dl_info di;
++      if (dladdr(bt[i], &di) && di.dli_fbase)
++        o += snprintf(line + o, sizeof(line) - o, "%s%lx",
++          i > 1 ? "," : "", (unsigned long)((char*)bt[i] - (char*)di.dli_fbase));
++    }
++    fprintf(stderr, "%s\n", line);
++#endif
++  }
++
++
+   void DxvkContext::endRenderPass(bool suspend) {
+     if (m_flags.test(DxvkContextFlag::GpRenderPassActive)) {
++      if (bvmPassLogEnabled()) {
++        const auto& rt = m_state.om.renderTargets;
++        const auto& view = rt.color[0].view ? rt.color[0].view : rt.depth.view;
++
++        if (view) {
++          const VkViewport& vp = m_state.vp.viewports[0];
++          const VkRect2D& sc = m_state.vp.scissorRects[0];
++          bvmOp("pass-end", view->image(), "susp=%d vp=%g,%g %gx%g sc=%d,%d %ux%u vpCount=%u",
++            int(suspend), vp.x, vp.y, vp.width, vp.height, sc.offset.x, sc.offset.y, sc.extent.width, sc.extent.height,
++            m_state.vp.viewportCount);
++        }
++      }
++
++      bvmLogPassEnd(suspend, m_state.om.framebufferInfo);
++
+       bool unsynchronized = m_flags.test(DxvkContextFlag::GpRenderPassUnsynchronized);
+ 
+       if (unsynchronized) {
+@@ -6025,6 +6435,12 @@ namespace dxvk {
+                   DxvkContextFlag::GpRenderPassNeedsFlush,
+                   DxvkContextFlag::GpRenderPassUnsynchronized);
+ 
++      if (m_bvmMerged) {
++        // Rebuild the real (depth-less) framebuffer on the next draw
++        m_bvmMerged = false;
++        m_flags.set(DxvkContextFlag::GpDirtyRenderTargets);
++      }
++
+       this->pauseTransformFeedback();
+ 
+       m_queryManager.endQueries(m_cmd, VK_QUERY_TYPE_OCCLUSION);
+@@ -6665,8 +7081,10 @@ namespace dxvk {
+     // Retrieve and bind actual Vulkan pipeline handle
+     auto pipelineInfo = m_state.gp.pipeline->getPipelineHandle(m_state.gp.state);
+ 
+-    if (unlikely(!pipelineInfo.handle))
++    if (unlikely(!pipelineInfo.handle)) {
++      bvmNoteSkippedDraw();
+       return false;
++    }
+ 
+     m_cmd->cmdBindPipeline(DxvkCmdBuffer::ExecBuffer,
+       VK_PIPELINE_BIND_POINT_GRAPHICS, pipelineInfo.handle);
+@@ -7374,6 +7792,424 @@ namespace dxvk {
+   }
+ 
+ 
++  // BVM: tessellated draw on a device without tessellation. VS+HS+DS run on
++  // lavapipe (see dxvk_tessemu.cpp); the captured triangles are drawn here with
++  // a generated pass-through vertex shader and the application's pixel shader.
++  // BVM_DXVK_TESSEMU=0 disables; BVM_DXVK_PASSLOG=1 prints a summary.
++  bool DxvkContext::bvmTessEmuDraw(
++          bool      indexed,
++          uint32_t  count,
++          uint32_t  instanceCount,
++          uint32_t  first,
++          int32_t   vertexOffset,
++          uint32_t  firstInstance) {
++    static const bool enabled = [] {
++      const char* e = getenv("BVM_DXVK_TESSEMU");
++      return !(e && *e == '0');
++    }();
++
++    static std::atomic<uint32_t> okCount = { 0u };
++    static std::atomic<uint32_t> failCount = { 0u };
++    static std::atomic<unsigned long long> lastSummaryUs = { 0ull };
++    static std::mutex reasonMutex;
++    static std::set<std::string> reasons;
++
++    auto fail = [&] (const std::string& why) {
++      failCount.fetch_add(1u);
++
++      std::lock_guard<std::mutex> lock(reasonMutex);
++
++      if (reasons.insert(why).second)
++        Logger::warn(str::format("BVMTESS: draw not emulated: ", why));
++
++      return false;
++    };
++
++    auto summary = [&] () {
++      if (!bvmPassLogEnabled())
++        return;
++
++      unsigned long long now = bvmNowUs();
++      unsigned long long last = lastSummaryUs.load();
++
++      if (!last) {
++        lastSummaryUs.compare_exchange_strong(last, now);
++      } else if (now - last >= 5000000ull && lastSummaryUs.compare_exchange_strong(last, now)) {
++        fprintf(stderr, "BVMTESS t_us=%llu pid=%d emulated_last_5s=%u failed_last_5s=%u\n",
++          now, (int)getpid(), okCount.exchange(0u), failCount.exchange(0u));
++      }
++    };
++
++    summary();
++
++    if (!enabled)
++      return fail("disabled by BVM_DXVK_TESSEMU=0");
++
++    if (!count)
++      return true;
++
++    if (instanceCount != 1u)
++      return fail("instanced tessellated draw");
++
++    const auto& sh = m_state.gp.shaders;
++
++    if (!sh.vs || !sh.tcs || !sh.tes || sh.gs)
++      return fail("unsupported shader combination");
++
++    if (m_state.gp.state.ia.primitiveTopology() != VK_PRIMITIVE_TOPOLOGY_PATCH_LIST)
++      return fail("tessellation shaders without patch list topology");
++
++    DxvkTessEmuRequest rq;
++    rq.vs = sh.vs;
++    rq.tcs = sh.tcs;
++    rq.tes = sh.tes;
++
++    DxvkGraphicsPipelineShaderState linkage(sh, m_state.gp.state);
++    rq.vsLinkage = linkage.vsInfo;
++    rq.tcsLinkage = linkage.tcsInfo;
++    rq.tesLinkage = linkage.tesInfo;
++
++    rq.patchControlPoints = m_state.gp.state.ia.patchVertexCount();
++
++    // Vertex input state
++    const auto& il = m_state.gp.state.il;
++
++    for (uint32_t i = 0u; i < il.attributeCount(); i++) {
++      const auto& a = m_state.gp.state.ilAttributes[i];
++      rq.attributes.push_back({ a.location(), a.binding(), a.format(), a.offset() });
++    }
++
++    for (uint32_t i = 0u; i < il.bindingCount(); i++) {
++      const auto& b = m_state.gp.state.ilBindings[i];
++      uint32_t binding = b.binding();
++
++      VkVertexInputBindingDescription desc = { };
++      desc.binding = binding;
++      desc.stride = m_state.vi.vertexStrides[binding];
++      desc.inputRate = b.inputRate();
++      rq.bindings.push_back(desc);
++
++      const auto& slice = m_state.vi.vertexBuffers[binding];
++
++      if (slice.defined()) {
++        rq.vertexBuffers[binding].data = reinterpret_cast<const uint8_t*>(slice.mapPtr(0));
++        rq.vertexBuffers[binding].size = slice.length();
++      }
++    }
++
++    rq.indexed = indexed;
++    rq.indexType = m_state.vi.indexType;
++
++    if (indexed && m_state.vi.indexBuffer.defined()) {
++      rq.indexData = reinterpret_cast<const uint8_t*>(m_state.vi.indexBuffer.mapPtr(0));
++      rq.indexSize = m_state.vi.indexBuffer.length();
++    }
++
++    rq.count = count;
++    rq.first = first;
++    rq.vertexOffset = vertexOffset;
++    rq.firstInstance = firstInstance;
++
++    uint32_t builtIns = 0u;
++    std::memcpy(&builtIns, &m_state.pc.constantData[
++      computePushDataBlockOffset(DxvkPushDataBlock::computeIndex(VK_SHADER_STAGE_ALL_GRAPHICS))],
++      sizeof(builtIns));
++
++    // D3D11 derives the max tess factor from the device limit, which is 0 on
++    // V3D; the HS clamps all factors to it and would emit nothing.
++    uint32_t maxTessMask = ((1u << DxvkBuiltInPushData::MaxTessFactorBits) - 1u)
++      << DxvkBuiltInPushData::MaxTessFactorOffset;
++
++    if (!(builtIns & maxTessMask))
++      builtIns |= 64u << DxvkBuiltInPushData::MaxTessFactorOffset;
++
++    rq.builtIns = builtIns;
++
++    rq.resolver = [this] (VkShaderStageFlagBits stage, const DxvkShaderDescriptor& d,
++        const uint8_t*& data, size_t& size) -> bool {
++      (void)stage;
++      VkDescriptorType type = d.getDescriptorType();
++      uint32_t index = d.getResourceIndex();
++
++      bool isBuffer = type == VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER
++        || (type == VK_DESCRIPTOR_TYPE_STORAGE_BUFFER && d.isUniformBuffer());
++
++      if (!isBuffer || index >= m_uniformBuffers.size())
++        return false;
++
++      const DxvkBufferSlice& slice = m_uniformBuffers[index];
++
++      if (!slice.defined())
++        return false;
++
++      data = reinterpret_cast<const uint8_t*>(slice.mapPtr(0));
++      size = slice.length();
++      return data != nullptr;
++    };
++
++    DxvkTessEmuOutput out;
++    std::string why;
++
++    unsigned long long t0 = bvmNowUs();
++    bool ran = DxvkTessEmu::get().run(rq, out, why);
++
++    if (bvmPassLogEnabled()) {
++      static std::atomic<uint32_t> logged = { 0u };
++
++      if (logged.fetch_add(1u) < 300u) {
++        fprintf(stderr, "BVMTESS draw t_us=%llu pid=%d %s count=%u indexed=%d verts_out=%u took_us=%llu%s%s\n",
++          t0, (int)getpid(), ran ? "ok" : "FAIL", count, indexed ? 1 : 0, out.vertexCount,
++          bvmNowUs() - t0, ran ? "" : " why=", ran ? "" : why.c_str());
++
++        if (ran && out.vertexCount) {
++          const auto& gs = m_state.gp.state;
++          fprintf(stderr, "BVMTESS   rt0fmt=%d logicop=%d/%d wm0=%x blend0=%d samples=%u rs.samples=%u ms.samples=%u pc.samples=%u fb=%ux%u stride=%u\n",
++            int(gs.rt.getColorFormat(0)), int(gs.om.enableLogicOp()), int(gs.om.logicOp()),
++            unsigned(gs.omBlend[0].colorWriteMask()), int(gs.omBlend[0].blendEnable()),
++            unsigned(m_state.om.framebufferInfo.getSampleCount()),
++            unsigned(gs.rs.sampleCount()), unsigned(gs.ms.sampleCount()),
++            unsigned(rq.builtIns & 0xffu),
++            m_state.om.framebufferInfo.size().width, m_state.om.framebufferInfo.size().height,
++            out.layout->stride);
++
++          // CPU XOR-parity raster of the captured triangles (what the R16_UINT
++          // logic-op XOR target should contain), printed as ASCII if small.
++          {
++            const uint32_t W = m_state.om.framebufferInfo.size().width;
++            const uint32_t H = m_state.om.framebufferInfo.size().height;
++            const uint32_t nf = out.layout->stride / 4u;
++            float minX = 1e9f, minY = 1e9f, maxX = -1e9f, maxY = -1e9f;
++            std::vector<float> px(out.vertexCount * 2u);
++
++            for (uint32_t v = 0u; v < out.vertexCount; v++) {
++              const float* f = reinterpret_cast<const float*>(out.vertices.data() + size_t(v) * out.layout->stride);
++              px[v * 2u + 0u] = (f[0] / f[3] + 1.0f) * 0.5f * float(W);
++              px[v * 2u + 1u] = (1.0f - f[1] / f[3]) * 0.5f * float(H);
++              minX = std::min(minX, px[v * 2u]); maxX = std::max(maxX, px[v * 2u]);
++              minY = std::min(minY, px[v * 2u + 1u]); maxY = std::max(maxY, px[v * 2u + 1u]);
++            }
++
++            fprintf(stderr, "BVMTESS   bbox px x=[%g,%g] y=[%g,%g] floats/vertex=%u\n", minX, maxX, minY, maxY, nf);
++
++            int x0 = int(std::floor(minX)), y0 = int(std::floor(minY));
++            int x1 = int(std::ceil(maxX)), y1 = int(std::ceil(maxY));
++
++            if (x1 - x0 > 0 && x1 - x0 <= 100 && y1 - y0 > 0 && y1 - y0 <= 60) {
++              std::vector<uint8_t> grid(size_t(x1 - x0) * (y1 - y0), 0u);
++
++              for (uint32_t t = 0u; t + 2u < out.vertexCount; t += 3u) {
++                const float* a = &px[t * 2u]; const float* b = a + 2; const float* c = b + 2;
++                float area = (b[0] - a[0]) * (c[1] - a[1]) - (b[1] - a[1]) * (c[0] - a[0]);
++                if (area == 0.0f) continue;
++
++                for (int y = y0; y < y1; y++) for (int x = x0; x < x1; x++) {
++                  float sx = x + 0.5f, sy = y + 0.5f;
++                  float w0 = (b[0] - a[0]) * (sy - a[1]) - (b[1] - a[1]) * (sx - a[0]);
++                  float w1 = (c[0] - b[0]) * (sy - b[1]) - (c[1] - b[1]) * (sx - b[0]);
++                  float w2 = (a[0] - c[0]) * (sy - c[1]) - (a[1] - c[1]) * (sx - c[0]);
++                  bool in = area > 0.0f ? (w0 >= 0 && w1 >= 0 && w2 >= 0) : (w0 <= 0 && w1 <= 0 && w2 <= 0);
++                  if (in) grid[size_t(y - y0) * (x1 - x0) + (x - x0)] ^= 1u;
++                }
++              }
++
++              for (int y = 0; y < y1 - y0; y++) {
++                std::string row;
++                for (int x = 0; x < x1 - x0; x++) row += grid[size_t(y) * (x1 - x0) + x] ? '#' : '.';
++                fprintf(stderr, "BVMTESS   |%s\n", row.c_str());
++              }
++            }
++          }
++
++          for (uint32_t v = 0u; v < std::min(out.vertexCount, 6u); v++) {
++            const float* f = reinterpret_cast<const float*>(out.vertices.data() + size_t(v) * out.layout->stride);
++            fprintf(stderr, "BVMTESS   v%u:", v);
++            for (uint32_t k = 0u; k < out.layout->stride / 4u; k++)
++              fprintf(stderr, " %g", f[k]);
++            fprintf(stderr, "\n");
++          }
++        }
++      }
++    }
++
++    if (!ran)
++      return fail(why);
++
++    okCount.fetch_add(1u);
++
++    if (!out.vertexCount)
++      return true;
++
++    const auto& layout = *out.layout;
++
++    // Upload the tessellated vertices
++    DxvkBufferCreateInfo bufInfo = { };
++    bufInfo.size = out.vertices.size();
++    bufInfo.usage = VK_BUFFER_USAGE_VERTEX_BUFFER_BIT;
++    bufInfo.stages = VK_PIPELINE_STAGE_VERTEX_INPUT_BIT;
++    bufInfo.access = VK_ACCESS_VERTEX_ATTRIBUTE_READ_BIT;
++    bufInfo.debugName = "bvm tessemu vertices";
++
++    Rc<DxvkBuffer> buffer = m_device->createBuffer(bufInfo,
++      VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
++
++    if (!buffer || !buffer->mapPtr(0))
++      return fail("cannot allocate host-visible vertex buffer");
++
++    std::memcpy(buffer->mapPtr(0), out.vertices.data(), out.vertices.size());
++
++    // Save the state that gets replaced
++    DxvkGraphicsPipelineShaders savedShaders = m_state.gp.shaders;
++    DxvkIaInfo savedIa = m_state.gp.state.ia;
++    DxvkIlInfo savedIl = m_state.gp.state.il;
++
++    DxvkIlAttribute savedAttributes[DxvkLimits::MaxNumVertexAttributes];
++    DxvkIlBinding savedBindings[DxvkLimits::MaxNumVertexBindings];
++    uint32_t savedExtents[DxvkLimits::MaxNumVertexBindings];
++
++    for (uint32_t i = 0u; i < DxvkLimits::MaxNumVertexAttributes; i++)
++      savedAttributes[i] = m_state.gp.state.ilAttributes[i];
++
++    for (uint32_t i = 0u; i < DxvkLimits::MaxNumVertexBindings; i++) {
++      savedBindings[i] = m_state.gp.state.ilBindings[i];
++      savedExtents[i] = m_state.vi.vertexExtents[i];
++    }
++
++    DxvkBufferSlice savedBuffer0 = m_state.vi.vertexBuffers[0];
++    uint32_t savedStride0 = m_state.vi.vertexStrides[0];
++
++    // Swap in the pass-through pipeline
++    this->bindShader<VK_SHADER_STAGE_VERTEX_BIT>(Rc<DxvkShader>(layout.passthroughVs));
++    this->bindShader<VK_SHADER_STAGE_TESSELLATION_CONTROL_BIT>(Rc<DxvkShader>());
++    this->bindShader<VK_SHADER_STAGE_TESSELLATION_EVALUATION_BIT>(Rc<DxvkShader>());
++
++    this->setInputAssemblyState(DxvkInputAssemblyState(layout.topology, false));
++
++    std::array<DxvkVertexInput, 16> attributes = { };
++
++    for (size_t i = 0u; i < layout.attributes.size(); i++) {
++      DxvkVertexAttribute a = { };
++      a.location = layout.attributes[i].location;
++      a.binding = 0u;
++      a.format = layout.attributes[i].format;
++      a.offset = layout.attributes[i].offset;
++      attributes[i] = DxvkVertexInput(a);
++    }
++
++    DxvkVertexBinding binding = { };
++    binding.binding = 0u;
++    binding.extent = layout.stride;
++    binding.inputRate = VK_VERTEX_INPUT_RATE_VERTEX;
++    binding.divisor = 0u;
++    DxvkVertexInput bindingInput(binding);
++
++    this->setInputLayout(layout.attributes.size(), attributes.data(), 1u, &bindingInput);
++    this->bindVertexBuffer(0u, DxvkBufferSlice(buffer), layout.stride);
++
++    VkDrawIndirectCommand cmd = { };
++    cmd.vertexCount = out.vertexCount;
++    cmd.instanceCount = 1u;
++
++    this->drawGeneric<false, VkDrawIndirectCommand>(1u, &cmd);
++
++    // Restore the application's state
++    m_state.gp.shaders = savedShaders;
++    m_state.gp.state.ia = savedIa;
++    m_state.gp.state.il = savedIl;
++
++    for (uint32_t i = 0u; i < DxvkLimits::MaxNumVertexAttributes; i++)
++      m_state.gp.state.ilAttributes[i] = savedAttributes[i];
++
++    for (uint32_t i = 0u; i < DxvkLimits::MaxNumVertexBindings; i++) {
++      m_state.gp.state.ilBindings[i] = savedBindings[i];
++      m_state.vi.vertexExtents[i] = savedExtents[i];
++    }
++
++    m_state.vi.vertexBuffers[0] = std::move(savedBuffer0);
++    m_state.vi.vertexStrides[0] = savedStride0;
++
++    m_flags.set(
++      DxvkContextFlag::GpDirtyPipeline,
++      DxvkContextFlag::GpDirtyPipelineState,
++      DxvkContextFlag::GpDirtyVertexBuffers);
++
++    return true;
++  }
++
++
++  // BVM: keep the running pass open when the app switches to a color-only
++  // framebuffer that renders to the same color views while depth is not used
++  // (ANGLE alpha fixup quad). Avoids a full LOAD->STORE pass of the target.
++  // BVM_DXVK_NOMERGE=1 disables; BVM_DXVK_PASSLOG=1 logs every decision.
++  bool DxvkContext::bvmTryMergePass() {
++    static const bool disabled = [] {
++      const char* e = getenv("BVM_DXVK_NOMERGE");
++      return e && *e && *e != '0';
++    }();
++
++    const auto& cur = m_state.om.framebufferInfo.attachments();
++    const auto& nxt = m_state.om.renderTargets;
++
++    // Only the "same colors, depth dropped" shape is a candidate
++    if (!cur.depth.view || nxt.depth.view)
++      return false;
++
++    uint32_t nColors = 0u;
++    uint32_t viewEq = 0u, imageEq = 0u, mismatch = 0u;
++
++    for (uint32_t i = 0; i < MaxNumRenderTargets; i++) {
++      const auto& a = cur.color[i].view;
++      const auto& b = nxt.color[i].view;
++
++      if (!a && !b)
++        continue;
++
++      nColors++;
++
++      if (a == b) {
++        viewEq++;
++      } else if (a && b && a->image() == b->image()
++          && a->info().format == b->info().format
++          && a->imageSubresources().baseMipLevel == b->imageSubresources().baseMipLevel
++          && a->imageSubresources().levelCount == b->imageSubresources().levelCount
++          && a->imageSubresources().baseArrayLayer == b->imageSubresources().baseArrayLayer
++          && a->imageSubresources().layerCount == b->imageSubresources().layerCount
++          && a->info().unpackSwizzle().r == b->info().unpackSwizzle().r
++          && a->info().unpackSwizzle().g == b->info().unpackSwizzle().g
++          && a->info().unpackSwizzle().b == b->info().unpackSwizzle().b
++          && a->info().unpackSwizzle().a == b->info().unpackSwizzle().a) {
++        imageEq++;
++      } else {
++        mismatch++;
++      }
++    }
++
++    // Depth/stencil state is overridden to "off" while merged (D3D11 semantics
++    // without a DSV), which needs the dynamic depth/stencil state commands.
++    const auto& ds = m_state.dyn.depthStencilState;
++    bool depthUsed = ds.depthTest() || ds.depthWrite() || ds.stencilTest();
++    bool dynamic = m_flags.all(DxvkContextFlag::GpDynamicDepthTest,
++                               DxvkContextFlag::GpDynamicStencilTest);
++
++    bool ok = nColors && !mismatch && dynamic && !disabled
++           && !m_flags.test(DxvkContextFlag::GpRenderPassSuspended);
++
++    if (bvmPassLogEnabled()) {
++      fprintf(stderr, "BVMMERGE t_us=%llu pid=%d %ux%u colors=%u viewEq=%u imageEq=%u mismatch=%u depthUsed=%d disabled=%d => %s\n",
++        bvmNowUs(), (int)getpid(),
++        m_state.om.framebufferInfo.size().width, m_state.om.framebufferInfo.size().height,
++        nColors, viewEq, imageEq, mismatch, depthUsed ? 1 : 0, disabled ? 1 : 0,
++        ok ? "MERGE" : "no");
++    }
++
++    if (!ok)
++      return false;
++
++    m_bvmMerged = true;
++    m_flags.set(DxvkContextFlag::GpDirtyDepthTest, DxvkContextFlag::GpDirtyStencilTest);
++    return true;
++  }
++
++
+   void DxvkContext::updateRenderTargets() {
+     if (m_flags.test(DxvkContextFlag::GpDirtyRenderTargets)) {
+       m_flags.clr(DxvkContextFlag::GpDirtyRenderTargets);
+@@ -7382,10 +8218,20 @@ namespace dxvk {
+         // Only interrupt an active render pass if the render targets have actually
+         // changed since the last update. There are cases where client APIs cannot
+         // know in advance that consecutive draws use the same set of render targets.
+-        if (m_state.om.renderTargets == m_state.om.framebufferInfo.attachments())
++        if (m_state.om.renderTargets == m_state.om.framebufferInfo.attachments()) {
++          if (m_bvmMerged) {
++            m_bvmMerged = false;
++            m_flags.set(DxvkContextFlag::GpDirtyDepthTest, DxvkContextFlag::GpDirtyStencilTest);
++          }
++          return;
++        }
++
++        if (this->bvmTryMergePass())
+           return;
+       }
+ 
++      m_bvmMerged = false;
++
+       // End active render pass and reset load/store ops for the new render targets.
+       DxvkFramebufferInfo fbInfo = makeFramebufferInfo(m_state.om.renderTargets);
+ 
+@@ -7807,7 +8653,8 @@ namespace dxvk {
+       auto dsReadOnlyAspects = m_state.gp.state.rt.getDepthStencilReadOnlyAspects();
+       bool writable = !(dsReadOnlyAspects & VK_IMAGE_ASPECT_DEPTH_BIT);
+ 
+-      if (m_state.dyn.depthStencilState.depthTest()) {
++      // BVM: a merged draw has no depth attachment in the app's view
++      if (m_state.dyn.depthStencilState.depthTest() && !m_bvmMerged) {
+         bool written = writable &&
+           m_state.dyn.depthStencilState.depthTest() &&
+           m_state.dyn.depthStencilState.depthWrite();
+@@ -7831,7 +8678,7 @@ namespace dxvk {
+                     DxvkContextFlag::GpDynamicStencilTest)) {
+       m_flags.clr(DxvkContextFlag::GpDirtyStencilTest);
+ 
+-      if (m_state.dyn.depthStencilState.stencilTest()) {
++      if (m_state.dyn.depthStencilState.stencilTest() && !m_bvmMerged) {
+         auto dsReadOnlyAspects = m_state.gp.state.rt.getDepthStencilReadOnlyAspects();
+         bool writable = !(dsReadOnlyAspects & VK_IMAGE_ASPECT_STENCIL_BIT);
+ 
+diff --git a/src/dxvk/dxvk_context.h b/src/dxvk/dxvk_context.h
+index dacdfd5f..d00977b8 100644
+--- a/src/dxvk/dxvk_context.h
++++ b/src/dxvk/dxvk_context.h
+@@ -1397,6 +1397,10 @@ namespace dxvk {
+     uint64_t                m_latencyFrameId = 0u;
+     bool                    m_endLatencyTracking = false;
+ 
++    // BVM: running pass was kept open for a color-only RT switch (depth dropped)
++    bool                    m_bvmMerged = false;
++    bool                    m_bvmCoverageLoop = false;
++
+     DxvkImplicitResolveTracker  m_implicitResolves;
+ 
+     void blitImageFb(
+@@ -1731,7 +1735,17 @@ namespace dxvk {
+       const DxvkRenderTargets&      renderTargets);
+ 
+     void updateRenderTargets();
+-    
++
++    bool bvmTryMergePass();
++
++    bool bvmTessEmuDraw(
++            bool                    indexed,
++            uint32_t                count,
++            uint32_t                instanceCount,
++            uint32_t                first,
++            int32_t                 vertexOffset,
++            uint32_t                firstInstance);
++
+     bool flushDeferredClear(
+       const DxvkImage&              image,
+       const VkImageSubresourceRange& subresources);
+diff --git a/src/dxvk/dxvk_device.cpp b/src/dxvk/dxvk_device.cpp
+index 1092a158..3d0ce15d 100644
+--- a/src/dxvk/dxvk_device.cpp
++++ b/src/dxvk/dxvk_device.cpp
+@@ -826,6 +826,10 @@ namespace dxvk {
+     if (m_features.nvRawAccessChains.shaderRawAccessChains)
+       m_shaderOptions.spirv.set(DxvkShaderSpirvFlag::SupportsNvRawAccessChains);
+ 
++    // V3DV cannot compile the BaseVertex built-in (load_first_vertex aborts the driver)
++    if (!m_features.vk11.shaderDrawParameters)
++      m_shaderOptions.spirv.set(DxvkShaderSpirvFlag::NoBaseVertex);
++
+     // Mesa drivers generally optimize large constant arrays to a buffer, some other
+     // drivers do not and suffer a significant performance loss. Enable lowering on
+     // those drivers.
+diff --git a/src/dxvk/dxvk_device_info.cpp b/src/dxvk/dxvk_device_info.cpp
+index d0df438f..c1d9b0a7 100644
+--- a/src/dxvk/dxvk_device_info.cpp
++++ b/src/dxvk/dxvk_device_info.cpp
+@@ -796,7 +796,7 @@ namespace dxvk {
+       ENABLE_FEATURE(core.features, depthBounds, false),
+       ENABLE_FEATURE(core.features, depthClamp, true),
+       ENABLE_FEATURE(core.features, drawIndirectFirstInstance, false),
+-      ENABLE_FEATURE(core.features, dualSrcBlend, true),
++      ENABLE_FEATURE(core.features, dualSrcBlend, false),
+       ENABLE_FEATURE(core.features, fillModeNonSolid, true),
+       ENABLE_FEATURE(core.features, fragmentStoresAndAtomics, true),
+       ENABLE_FEATURE(core.features, fullDrawIndexUint32, true),
+@@ -805,21 +805,21 @@ namespace dxvk {
+       ENABLE_FEATURE(core.features, independentBlend, true),
+       ENABLE_FEATURE(core.features, largePoints, false),
+       ENABLE_FEATURE(core.features, logicOp, false),
+-      ENABLE_FEATURE(core.features, multiDrawIndirect, true),
+-      ENABLE_FEATURE(core.features, multiViewport, true),
++      ENABLE_FEATURE(core.features, multiDrawIndirect, false),
++      ENABLE_FEATURE(core.features, multiViewport, false),
+       ENABLE_FEATURE(core.features, occlusionQueryPrecise, true),
+       ENABLE_FEATURE(core.features, pipelineStatisticsQuery, false),
+       ENABLE_FEATURE(core.features, robustBufferAccess, true),
+       ENABLE_FEATURE(core.features, sampleRateShading, true),
+       ENABLE_FEATURE(core.features, samplerAnisotropy, true),
+       ENABLE_FEATURE(core.features, shaderClipDistance, true),
+-      ENABLE_FEATURE(core.features, shaderCullDistance, true),
++      ENABLE_FEATURE(core.features, shaderCullDistance, false),
+       ENABLE_FEATURE(core.features, shaderFloat64, false),
+       ENABLE_FEATURE(core.features, shaderImageGatherExtended, true),
+-      ENABLE_FEATURE(core.features, shaderInt16, true),
+-      ENABLE_FEATURE(core.features, shaderInt64, true),
++      ENABLE_FEATURE(core.features, shaderInt16, false),
++      ENABLE_FEATURE(core.features, shaderInt64, false),
+       ENABLE_FEATURE(core.features, shaderUniformBufferArrayDynamicIndexing, false),
+-      ENABLE_FEATURE(core.features, shaderSampledImageArrayDynamicIndexing, true),
++      ENABLE_FEATURE(core.features, shaderSampledImageArrayDynamicIndexing, false),
+       ENABLE_FEATURE(core.features, shaderStorageBufferArrayDynamicIndexing, false),
+       ENABLE_FEATURE(core.features, shaderStorageImageArrayDynamicIndexing, false),
+       ENABLE_FEATURE(core.features, sparseBinding, false),
+@@ -834,16 +834,16 @@ namespace dxvk {
+       ENABLE_FEATURE(core.features, shaderResourceResidency, false),
+       ENABLE_FEATURE(core.features, shaderResourceMinLod, false),
+       ENABLE_FEATURE(core.features, tessellationShader, false),
+-      ENABLE_FEATURE(core.features, textureCompressionBC, true),
++      ENABLE_FEATURE(core.features, textureCompressionBC, false),
+       ENABLE_FEATURE(core.features, variableMultisampleRate, false),
+       ENABLE_FEATURE(core.features, vertexPipelineStoresAndAtomics, false),
+       ENABLE_FEATURE(core.features, wideLines, false),
+ 
+-      ENABLE_FEATURE(vk11, shaderDrawParameters, true),
++      ENABLE_FEATURE(vk11, shaderDrawParameters, false),
+       ENABLE_FEATURE(vk11, storagePushConstant16, false),
+ 
+       ENABLE_FEATURE(vk12, bufferDeviceAddress, true),
+-      ENABLE_FEATURE(vk12, descriptorIndexing, true),
++      ENABLE_FEATURE(vk12, descriptorIndexing, false),
+       ENABLE_FEATURE(vk12, shaderUniformTexelBufferArrayDynamicIndexing, false),
+       ENABLE_FEATURE(vk12, shaderStorageTexelBufferArrayDynamicIndexing, false),
+       ENABLE_FEATURE(vk12, shaderUniformBufferArrayNonUniformIndexing, false),
+@@ -852,17 +852,17 @@ namespace dxvk {
+       ENABLE_FEATURE(vk12, shaderStorageImageArrayNonUniformIndexing, false),
+       ENABLE_FEATURE(vk12, shaderUniformTexelBufferArrayNonUniformIndexing, false),
+       ENABLE_FEATURE(vk12, shaderStorageTexelBufferArrayNonUniformIndexing, false),
+-      ENABLE_FEATURE(vk12, descriptorBindingSampledImageUpdateAfterBind, true),
+-      ENABLE_FEATURE(vk12, descriptorBindingUpdateUnusedWhilePending, true),
+-      ENABLE_FEATURE(vk12, descriptorBindingPartiallyBound, true),
++      ENABLE_FEATURE(vk12, descriptorBindingSampledImageUpdateAfterBind, false),
++      ENABLE_FEATURE(vk12, descriptorBindingUpdateUnusedWhilePending, false),
++      ENABLE_FEATURE(vk12, descriptorBindingPartiallyBound, false),
+       ENABLE_FEATURE(vk12, drawIndirectCount, false),
+       ENABLE_FEATURE(vk12, hostQueryReset, true),
+-      ENABLE_FEATURE(vk12, runtimeDescriptorArray, true),
++      ENABLE_FEATURE(vk12, runtimeDescriptorArray, false),
+       ENABLE_FEATURE(vk12, samplerFilterMinmax, false),
+       ENABLE_FEATURE(vk12, samplerMirrorClampToEdge, true),
+       ENABLE_FEATURE(vk12, scalarBlockLayout, true),
+       ENABLE_FEATURE(vk12, shaderFloat16, false),
+-      ENABLE_FEATURE(vk12, shaderInt8, true),
++      ENABLE_FEATURE(vk12, shaderInt8, false),
+       ENABLE_FEATURE(vk12, shaderOutputViewportIndex, false),
+       ENABLE_FEATURE(vk12, shaderOutputLayer, false),
+       ENABLE_FEATURE(vk12, timelineSemaphore, true),
+@@ -947,9 +947,9 @@ namespace dxvk {
+       ENABLE_EXT_FEATURE(extPageableDeviceLocalMemory, pageableDeviceLocalMemory, false),
+ 
+       /* Robustness, all features effectively required for correctness */
+-      ENABLE_EXT_FEATURE(extRobustness2, robustBufferAccess2, true),
++      ENABLE_EXT_FEATURE(extRobustness2, robustBufferAccess2, false),
+       ENABLE_EXT_FEATURE(extRobustness2, robustImageAccess2, false),
+-      ENABLE_EXT_FEATURE(extRobustness2, nullDescriptor, true),
++      ENABLE_EXT_FEATURE(extRobustness2, nullDescriptor, false),
+ 
+       /* Sample locations, used to "disable" MSAA rendering */
+       ENABLE_EXT(extSampleLocations, false),
+@@ -1004,14 +1004,14 @@ namespace dxvk {
+ 
+       /* Maintenance features, relied on in various parts of the code */
+       ENABLE_EXT_FEATURE(khrMaintenance5, maintenance5, true),
+-      ENABLE_EXT_FEATURE(khrMaintenance6, maintenance6, true),
++      ENABLE_EXT_FEATURE(khrMaintenance6, maintenance6, false),
+       ENABLE_EXT_FEATURE(khrMaintenance7, maintenance7, false),
+       ENABLE_EXT_FEATURE(khrMaintenance8, maintenance8, false),
+       ENABLE_EXT_FEATURE(khrMaintenance9, maintenance9, false),
+       ENABLE_EXT_FEATURE(khrMaintenance10, maintenance10, false),
+ 
+       /* Dependency for graphics pipeline library */
+-      ENABLE_EXT(khrPipelineLibrary, true),
++      ENABLE_EXT(khrPipelineLibrary, false),
+ 
+       /* Present wait, used for frame pacing and statistics */
+       ENABLE_EXT_FEATURE(khrPresentId, presentId, false),
+diff --git a/src/dxvk/dxvk_graphics.cpp b/src/dxvk/dxvk_graphics.cpp
+index 02b91f1e..c3dc2989 100644
+--- a/src/dxvk/dxvk_graphics.cpp
++++ b/src/dxvk/dxvk_graphics.cpp
+@@ -1469,7 +1469,12 @@ namespace dxvk {
+       flags.pNext = std::exchange(info.pNext, &flags);
+     
+     VkPipeline pipeline = VK_NULL_HANDLE;
++    auto bvmT0 = dxvk::high_resolution_clock::now();
+     VkResult vr = vk->vkCreateGraphicsPipelines(vk->device(), VK_NULL_HANDLE, 1, &info, nullptr, &pipeline);
++    auto bvmUs = std::chrono::duration_cast<std::chrono::microseconds>(dxvk::high_resolution_clock::now() - bvmT0).count();
++
++    // Synchronous on the CS thread (no pipeline libraries on V3DV): every one of these stalls rendering
++    Logger::warn(str::format("BVMDIAG pipeline compile ", bvmUs / 1000, ".", (bvmUs % 1000) / 100, " ms"));
+ 
+     if (vr != VK_SUCCESS) {
+       Logger::err(str::format("DxvkGraphicsPipeline: Failed to compile pipeline: ", vr));
+diff --git a/src/dxvk/dxvk_image.cpp b/src/dxvk/dxvk_image.cpp
+index 7fd7de71..246e45ac 100644
+--- a/src/dxvk/dxvk_image.cpp
++++ b/src/dxvk/dxvk_image.cpp
+@@ -834,6 +834,9 @@ namespace dxvk {
+     if (createInfo.usage & VK_IMAGE_USAGE_TRANSFER_DST_BIT)
+       requiredFormatFeatures |= VK_FORMAT_FEATURE_TRANSFER_DST_BIT;
+ 
++    // Pass 0 honours dmabufForceLinear; pass 1 is a fallback for drivers
++    // (V3D) whose linear modifier cannot be sampled.
++    for (int bvmPass = 0; bvmPass < 2 && m_dmabufModifiers.empty(); bvmPass++)
+     for (const auto& props : modifierProperties) {
+       if ((props.drmFormatModifierTilingFeatures & requiredFormatFeatures) != requiredFormatFeatures)
+         continue;
+@@ -846,6 +849,7 @@ namespace dxvk {
+       // plumbing) accept only DRM_FORMAT_MOD_LINEAR.
+       if (sharingInfo.mode == DxvkSharedHandleMode::Export
+        && sharingInfo.dmabufForceLinear
++       && bvmPass == 0
+        && props.drmFormatModifier != 0u)
+         continue;
+ 
+@@ -867,12 +871,26 @@ namespace dxvk {
+       VkExternalImageFormatProperties externalProperties = { VK_STRUCTURE_TYPE_EXTERNAL_IMAGE_FORMAT_PROPERTIES };
+       VkImageFormatProperties2 imageFormatProperties = { VK_STRUCTURE_TYPE_IMAGE_FORMAT_PROPERTIES_2, &externalProperties };
+ 
+-      if (vki->vkGetPhysicalDeviceImageFormatProperties2(device->adapter()->handle(),
+-          &imageFormatInfo, &imageFormatProperties) != VK_SUCCESS)
++      VkResult bvmRes = vki->vkGetPhysicalDeviceImageFormatProperties2(device->adapter()->handle(),
++          &imageFormatInfo, &imageFormatProperties);
++
++      Logger::err(str::format("BVMDIAG mod=0x", std::hex, props.drmFormatModifier, " res=", std::dec, int(bvmRes),
++        " extfeat=0x", std::hex, externalProperties.externalMemoryProperties.externalMemoryFeatures,
++        " required=0x", uint32_t(requiredFeatures),
++        " max=", std::dec, imageFormatProperties.imageFormatProperties.maxExtent.width, "x",
++        imageFormatProperties.imageFormatProperties.maxExtent.height,
++        " mips=", imageFormatProperties.imageFormatProperties.maxMipLevels));
++
++      if (bvmRes != VK_SUCCESS)
+         continue;
+ 
+       const auto& limits = imageFormatProperties.imageFormatProperties;
+ 
++      Logger::err(str::format("BVMDIAG limits maxExtent=", limits.maxExtent.width, "x", limits.maxExtent.height,
++        "x", limits.maxExtent.depth, " maxMips=", limits.maxMipLevels, " maxLayers=", limits.maxArrayLayers,
++        " create=", createInfo.extent.width, "x", createInfo.extent.height, "x", createInfo.extent.depth,
++        " mips=", createInfo.mipLevels, " layers=", createInfo.arrayLayers));
++
+       if ((externalProperties.externalMemoryProperties.externalMemoryFeatures & requiredFeatures) != requiredFeatures
+        || createInfo.extent.width > limits.maxExtent.width
+        || createInfo.extent.height > limits.maxExtent.height
+@@ -885,6 +903,15 @@ namespace dxvk {
+     }
+ 
+     if (m_dmabufModifiers.empty()) {
++      Logger::err(str::format("BVMDIAG mode=", int(sharingInfo.mode), " reqmod=0x", std::hex, uint64_t(sharingInfo.dmabufModifier),
++        " reqplanes=", std::dec, sharingInfo.dmabufPlaneCount, " forceLinear=", int(sharingInfo.dmabufForceLinear)));
++      Logger::err(str::format("BVMDIAG usage=0x", std::hex, createInfo.usage, " flags=0x", createInfo.flags,
++        " required=0x", requiredFormatFeatures, " mods=", std::dec, modifierProperties.size(),
++        " ext=", createInfo.extent.width, "x", createInfo.extent.height, " mips=", createInfo.mipLevels,
++        " layers=", createInfo.arrayLayers, " samples=", uint32_t(createInfo.samples)));
++      for (const auto& p : modifierProperties)
++        Logger::err(str::format("BVMDIAG mod=0x", std::hex, p.drmFormatModifier,
++          " feat=0x", p.drmFormatModifierTilingFeatures));
+       Logger::err(str::format("Failed to create dmabuf-shared resource: no usable modifier for format ",
+         createInfo.format));
+       return false;
+diff --git a/src/dxvk/dxvk_memory.cpp b/src/dxvk/dxvk_memory.cpp
+index 09fc61a2..c31d06f4 100644
+--- a/src/dxvk/dxvk_memory.cpp
++++ b/src/dxvk/dxvk_memory.cpp
+@@ -1350,8 +1350,11 @@ namespace dxvk {
+ 
+     VkBuffer buffer = VK_NULL_HANDLE;
+ 
+-    if (vk->vkCreateBuffer(vk->device(), &info, nullptr, &buffer))
++    if (VkResult bvmRes = vk->vkCreateBuffer(vk->device(), &info, nullptr, &buffer)) {
++      Logger::err(str::format("BVMDIAG dmabuf buffer: vkCreateBuffer failed ", int(bvmRes),
++        " usage=0x", std::hex, info.usage, " size=", std::dec, info.size));
+       return nullptr;
++    }
+ 
+     VkMemoryFdPropertiesKHR fdProperties = { VK_STRUCTURE_TYPE_MEMORY_FD_PROPERTIES_KHR };
+ 
+@@ -1361,12 +1364,17 @@ namespace dxvk {
+     VkMemoryRequirements2 requirements = { VK_STRUCTURE_TYPE_MEMORY_REQUIREMENTS_2 };
+     vk->vkGetBufferMemoryRequirements2(vk->device(), &requirementInfo, &requirements);
+ 
+-    if (vk->vkGetMemoryFdPropertiesKHR(vk->device(),
++    if (VkResult bvmRes = vk->vkGetMemoryFdPropertiesKHR(vk->device(),
+           VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT, fd, &fdProperties)) {
++      Logger::err(str::format("BVMDIAG dmabuf buffer: vkGetMemoryFdPropertiesKHR failed ", int(bvmRes)));
+       vk->vkDestroyBuffer(vk->device(), buffer, nullptr);
+       return nullptr;
+     }
+ 
++    Logger::err(str::format("BVMDIAG dmabuf buffer: reqsize=", requirements.memoryRequirements.size,
++      " reqbits=0x", std::hex, requirements.memoryRequirements.memoryTypeBits,
++      " fdbits=0x", fdProperties.memoryTypeBits, " usage=0x", info.usage, std::dec, " size=", info.size));
++
+     requirements.memoryRequirements.memoryTypeBits &= fdProperties.memoryTypeBits;
+ 
+     VkMemoryDedicatedAllocateInfo dedicatedInfo = { VK_STRUCTURE_TYPE_MEMORY_DEDICATED_ALLOCATE_INFO };
+@@ -1383,6 +1391,8 @@ namespace dxvk {
+       allocation = allocateDedicatedMemory(requirements.memoryRequirements, allocationInfo, &importInfo);
+ 
+     if (!allocation) {
++      Logger::err("BVMDIAG dmabuf buffer: allocateDedicatedMemory (import) failed");
++
+       if (importInfo.fd >= 0)
+         close(importInfo.fd);
+ 
+@@ -1509,9 +1519,30 @@ namespace dxvk {
+         VkMemoryRequirements2 requirements = { VK_STRUCTURE_TYPE_MEMORY_REQUIREMENTS_2 };
+         vk->vkGetBufferMemoryRequirements2(vk->device(), &memInfo, &requirements);
+ 
+-        if ((requirements.memoryRequirements.size == size)
++        // V3DV pads buffer requirements (+256 bytes). Shrink the buffer so
++        // that its requirement fits the allocation exactly.
++        if (requirements.memoryRequirements.size > size) {
++          VkDeviceSize pad = requirements.memoryRequirements.size - size;
++          vk->vkDestroyBuffer(vk->device(), buffer, nullptr);
++          buffer = VK_NULL_HANDLE;
++          bufferInfo.size = size - pad;
++          status = vk->vkCreateBuffer(vk->device(), &bufferInfo, nullptr, &buffer);
++          if (status == VK_SUCCESS) {
++            memInfo.buffer = buffer;
++            vk->vkGetBufferMemoryRequirements2(vk->device(), &memInfo, &requirements);
++          }
++        }
++
++        Logger::warn(str::format("BVMDIAG gb status=", int(status), " bufsize=", bufferInfo.size,
++          " reqsize=", requirements.memoryRequirements.size, " size=", size,
++          " bits=0x", std::hex, requirements.memoryRequirements.memoryTypeBits, std::dec,
++          " align=", requirements.memoryRequirements.alignment));
++
++        // V3DV pads some sizes, so only require that the buffer fits
++        if ((requirements.memoryRequirements.size <= size)
+          && (requirements.memoryRequirements.memoryTypeBits & (1u << type.index))) {
+           status = vk->vkBindBufferMemory(vk->device(), buffer, result.memory, 0);
++          Logger::warn(str::format("BVMDIAG bind status=", int(status)));
+ 
+           if (status == VK_SUCCESS) {
+             result.buffer = buffer;
+diff --git a/src/dxvk/dxvk_sampler.cpp b/src/dxvk/dxvk_sampler.cpp
+index 68461c03..f39cc660 100644
+--- a/src/dxvk/dxvk_sampler.cpp
++++ b/src/dxvk/dxvk_sampler.cpp
+@@ -513,10 +513,12 @@ namespace dxvk {
+     DxvkSamplerKey defaultKey;
+     defaultKey.setFilter(VK_FILTER_LINEAR, VK_FILTER_LINEAR, VK_SAMPLER_MIPMAP_MODE_LINEAR);
+     defaultKey.setLodRange(-256.0f, 256.0f, 0.0f);
+-    defaultKey.setAddressModes(
+-      VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE,
+-      VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE,
+-      VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE);
++    // BVMDIAG: heap element 0 is this sampler. BVM_DXVK_SAMPLER_ALL=repeat makes it REPEAT too, to test whether V3DV
++    // always samples heap[0] regardless of the dynamic sampler index.
++    const char* bvmAll = std::getenv("BVM_DXVK_SAMPLER_ALL");
++    const VkSamplerAddressMode bvmDefaultMode = (bvmAll && std::string(bvmAll) == "repeat")
++      ? VK_SAMPLER_ADDRESS_MODE_REPEAT : VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
++    defaultKey.setAddressModes(bvmDefaultMode, bvmDefaultMode, bvmDefaultMode);
+     defaultKey.setReduction(VK_SAMPLER_REDUCTION_MODE_WEIGHTED_AVERAGE);
+ 
+     m_default = createSampler(defaultKey);
+diff --git a/src/dxvk/dxvk_shader.h b/src/dxvk/dxvk_shader.h
+index c0b3e779..7a3656bc 100644
+--- a/src/dxvk/dxvk_shader.h
++++ b/src/dxvk/dxvk_shader.h
+@@ -29,6 +29,11 @@ namespace dxvk {
+     static constexpr uint32_t MaxTessFactorOffset = SampleCountOffset + SampleCountBits;
+     static constexpr uint32_t MaxTessFactorBits = 8u;
+ 
++    // BVM: emulated forced-sample-count coverage. When non-zero, the pixel
++    // shader's SampleMask input reads these bits instead of the hardware mask.
++    static constexpr uint32_t ForcedCoverageOffset = MaxTessFactorOffset + MaxTessFactorBits;
++    static constexpr uint32_t ForcedCoverageBits = 16u;
++
+     DxvkBuiltInPushData() = default;
+ 
+     explicit DxvkBuiltInPushData(uint32_t sampleCount, uint32_t maxTessFactor)
+@@ -132,6 +137,9 @@ namespace dxvk {
+     /// Whether dynamic non-uniform resource indexing is
+     /// supported. Only applies to typed resources.
+     SupportsResourceIndexing    = 20u,
++    /// Device lacks shaderDrawParameters: do not use the BaseVertex
++    /// built-in (SV_VertexID then includes the draw's base vertex)
++    NoBaseVertex                = 21u,
+   };
+ 
+   using DxvkShaderSpirvFlags = Flags<DxvkShaderSpirvFlag>;
+@@ -178,6 +186,7 @@ namespace dxvk {
+     ExportsViewportIndexLayerFromVertexStage,
+     ExportsSampleMask,
+     UsesFragmentCoverage,
++    ReadsSampleMaskInput,
+     UsesSparseResidency,
+     TessellationPoints,
+     SemanticIo,
+diff --git a/src/dxvk/dxvk_shader_ir.cpp b/src/dxvk/dxvk_shader_ir.cpp
+index 7279825a..3edf9157 100644
+--- a/src/dxvk/dxvk_shader_ir.cpp
++++ b/src/dxvk/dxvk_shader_ir.cpp
+@@ -615,6 +615,60 @@ namespace dxvk {
+       if (builtIn == dxbc_spv::ir::BuiltIn::eIsFullyCovered)
+         m_metadata.flags.set(DxvkShaderFlag::UsesFragmentCoverage);
+ 
++      if (m_stage == dxbc_spv::ir::ShaderStage::ePixel
++       && builtIn == dxbc_spv::ir::BuiltIn::eSampleMask)
++        return wrapSampleMaskInput(op);
++
++      return ++op;
++    }
++
++
++    // BVM: D3D11 forced sample counts (Direct2D uses 16 on a single-sampled
++    // R16_UINT target) cannot be rasterized on V3D. The context instead draws
++    // once per sample position and passes that sample's bit in the built-in
++    // push data; this makes SV_Coverage read that mask when it is non-zero and
++    // the hardware mask otherwise.
++    dxbc_spv::ir::Builder::iterator wrapSampleMaskInput(dxbc_spv::ir::Builder::iterator op) {
++      m_metadata.flags.set(DxvkShaderFlag::ReadsSampleMaskInput);
++
++      small_vector<dxbc_spv::ir::SsaDef, 64u> uses;
++      m_builder.getUses(op->getDef(), uses);
++
++      auto type = op->getType();
++      auto decl = op->getDef();
++
++      auto ref = m_builder.getCode().first->getDef();
++
++      auto helper = m_builder.addBefore(ref, dxbc_spv::ir::Op::Function(type));
++      auto cursor = m_builder.setCursor(helper);
++
++      m_builder.add(dxbc_spv::ir::Op::Label());
++
++      auto hw = m_builder.add(dxbc_spv::ir::Op::InputLoad(type, decl, dxbc_spv::ir::SsaDef()));
++
++      auto bits = m_builder.add(dxbc_spv::ir::Op::PushDataLoad(
++        dxbc_spv::ir::ScalarType::eU32, defineBuiltInPushData(), dxbc_spv::ir::SsaDef()));
++      bits = m_builder.add(dxbc_spv::ir::Op::UBitExtract(dxbc_spv::ir::ScalarType::eU32,
++        bits, m_builder.makeConstant(DxvkBuiltInPushData::ForcedCoverageOffset),
++        m_builder.makeConstant(DxvkBuiltInPushData::ForcedCoverageBits)));
++
++      auto forced = m_builder.add(dxbc_spv::ir::Op::INe(dxbc_spv::ir::ScalarType::eBool,
++        bits, m_builder.makeConstant(0u)));
++      auto result = m_builder.add(dxbc_spv::ir::Op::Select(type, forced, bits, hw));
++
++      m_builder.add(dxbc_spv::ir::Op::Return(type, result));
++      m_builder.add(dxbc_spv::ir::Op::FunctionEnd());
++      m_builder.setCursor(cursor);
++
++      for (auto use : uses) {
++        const auto& useOp = m_builder.getOp(use);
++
++        if (useOp.getOpCode() == dxbc_spv::ir::OpCode::eInputLoad) {
++          m_builder.rewriteOp(useOp.getDef(),
++            dxbc_spv::ir::Op::FunctionCall(type, helper));
++        }
++      }
++
+       return ++op;
+     }
+ 
+@@ -1741,6 +1795,7 @@ namespace dxvk {
+     options.includeDebugNames = true;
+     options.nvRawAccessChains = m_info.options.spirv.test(DxvkShaderSpirvFlag::SupportsNvRawAccessChains);
+     options.dualSourceBlending = linkage && linkage->fsDualSrcBlend;
++    options.noBaseVertex = m_info.options.spirv.test(DxvkShaderSpirvFlag::NoBaseVertex);
+ 
+     if (m_info.options.spirv.all(DxvkShaderSpirvFlag::IndependentDenormMode,
+                                DxvkShaderSpirvFlag::SupportsRte32,
+diff --git a/src/dxvk/dxvk_tessemu.cpp b/src/dxvk/dxvk_tessemu.cpp
+new file mode 100644
+index 00000000..0c785471
+--- /dev/null
++++ b/src/dxvk/dxvk_tessemu.cpp
+@@ -0,0 +1,1481 @@
++#include <algorithm>
++#include <array>
++#include <cstdlib>
++#include <cstring>
++#include <map>
++#include <set>
++#include <unistd.h>
++
++#include "dxvk_shader_spirv.h"
++#include "dxvk_tessemu.h"
++
++#include "../spirv/spirv_include.h"
++#include "../util/log/log.h"
++#include "../util/util_string.h"
++
++namespace dxvk {
++
++  namespace {
++
++    // ------------------------------------------------------------------
++    // Minimal SPIR-V reader / writer for the domain shader's output
++    // interface. Only what is needed to capture the outputs with
++    // transform feedback and to replay them from a vertex shader.
++    // ------------------------------------------------------------------
++
++    struct SpvType {
++      uint32_t op = 0u;
++      uint32_t a = 0u;
++      uint32_t b = 0u;
++    };
++
++    struct OutVar {
++      uint32_t id = 0u;
++      uint32_t kind = 0u;       // 0 float, 1 sint, 2 uint
++      uint32_t comps = 1u;      // components per element
++      uint32_t elems = 1u;      // array length, or 1
++      bool     isArray = false;
++      bool     builtIn = false;
++      uint32_t builtInId = 0u;
++      bool     hasLocation = false;
++      uint32_t location = 0u;
++      bool     hasComponent = false;
++      uint32_t component = 0u;
++      bool     flat = false;
++      bool     noPerspective = false;
++      bool     centroid = false;
++      bool     sample = false;
++      uint32_t xfbOffset = 0u;
++    };
++
++    constexpr uint32_t OpCodeMask = 0xffffu;
++
++    bool isPreTypeOpcode(uint32_t op) {
++      switch (op) {
++        case spv::OpCapability:
++        case spv::OpExtension:
++        case spv::OpExtInstImport:
++        case spv::OpMemoryModel:
++        case spv::OpEntryPoint:
++        case spv::OpExecutionMode:
++        case spv::OpExecutionModeId:
++        case spv::OpString:
++        case spv::OpSource:
++        case spv::OpSourceExtension:
++        case spv::OpSourceContinued:
++        case spv::OpName:
++        case spv::OpMemberName:
++        case spv::OpModuleProcessed:
++        case spv::OpLine:
++        case spv::OpNoLine:
++        case spv::OpDecorate:
++        case spv::OpMemberDecorate:
++        case spv::OpDecorationGroup:
++        case spv::OpGroupDecorate:
++        case spv::OpGroupMemberDecorate:
++        case spv::OpDecorateId:
++        case spv::OpDecorateString:
++        case spv::OpMemberDecorateString:
++          return true;
++        default:
++          return false;
++      }
++    }
++
++    bool isHeaderOpcode(uint32_t op) {
++      switch (op) {
++        case spv::OpCapability:
++        case spv::OpExtension:
++        case spv::OpExtInstImport:
++        case spv::OpMemoryModel:
++        case spv::OpEntryPoint:
++        case spv::OpExecutionMode:
++        case spv::OpExecutionModeId:
++          return true;
++        default:
++          return false;
++      }
++    }
++
++
++    bool analyzeOutputs(
++      const uint32_t*       code,
++            size_t          words,
++            std::vector<OutVar>& result,
++            uint32_t&       entryId,
++            std::string&    why) {
++      std::unordered_map<uint32_t, SpvType> types;
++      std::unordered_map<uint32_t, uint32_t> constants;
++      std::unordered_map<uint32_t, std::vector<std::array<uint32_t, 3>>> decorations;
++      std::vector<std::pair<uint32_t, uint32_t>> outputs;   // (variable id, pointer type id)
++      entryId = 0u;
++
++      size_t i = 5u;
++
++      while (i < words) {
++        uint32_t len = code[i] >> 16u;
++        uint32_t op = code[i] & OpCodeMask;
++
++        if (!len || i + len > words) {
++          why = "malformed SPIR-V";
++          return false;
++        }
++
++        const uint32_t* o = &code[i + 1u];
++
++        switch (op) {
++          case spv::OpEntryPoint:
++            if (!entryId)
++              entryId = o[1];
++            break;
++
++          case spv::OpTypeInt:
++            types[o[0]] = { op, o[1], o[2] };
++            break;
++
++          case spv::OpTypeFloat:
++            types[o[0]] = { op, o[1], 0u };
++            break;
++
++          case spv::OpTypeVector:
++            types[o[0]] = { op, o[1], o[2] };
++            break;
++
++          case spv::OpTypeArray:
++            types[o[0]] = { op, o[1], o[2] };
++            break;
++
++          case spv::OpTypePointer:
++            types[o[0]] = { op, o[1], o[2] };
++            break;
++
++          case spv::OpTypeStruct:
++          case spv::OpTypeMatrix:
++          case spv::OpTypeBool:
++            types[o[0]] = { op, 0u, 0u };
++            break;
++
++          case spv::OpConstant:
++            if (len >= 4u)
++              constants[o[1]] = o[2];
++            break;
++
++          case spv::OpDecorate: {
++            std::array<uint32_t, 3> d = { o[1], len > 3u ? o[2] : 0u, 0u };
++            decorations[o[0]].push_back(d);
++          } break;
++
++          case spv::OpVariable:
++            if (o[2] == spv::StorageClassOutput)
++              outputs.emplace_back(o[1], o[0]);
++            break;
++
++          default:
++            break;
++        }
++
++        i += len;
++      }
++
++      for (auto [id, ptrType] : outputs) {
++        OutVar v = { };
++        v.id = id;
++
++        auto ptr = types.find(ptrType);
++
++        if (ptr == types.end() || ptr->second.op != spv::OpTypePointer) {
++          why = "output variable without pointer type";
++          return false;
++        }
++
++        uint32_t t = ptr->second.b;
++
++        auto at = types.find(t);
++
++        if (at != types.end() && at->second.op == spv::OpTypeArray) {
++          auto len = constants.find(at->second.b);
++
++          if (len == constants.end()) {
++            why = "output array with non-constant length";
++            return false;
++          }
++
++          v.isArray = true;
++          v.elems = len->second;
++          t = at->second.a;
++          at = types.find(t);
++        }
++
++        if (at != types.end() && at->second.op == spv::OpTypeVector) {
++          v.comps = at->second.b;
++          t = at->second.a;
++          at = types.find(t);
++        }
++
++        if (at == types.end()) {
++          why = "unknown output element type";
++          return false;
++        }
++
++        if (at->second.op == spv::OpTypeFloat && at->second.a == 32u) {
++          v.kind = 0u;
++        } else if (at->second.op == spv::OpTypeInt && at->second.a == 32u) {
++          v.kind = at->second.b ? 1u : 2u;
++        } else {
++          why = str::format("unsupported output element type (op ", at->second.op, ")");
++          return false;
++        }
++
++        if (v.comps < 1u || v.comps > 4u || !v.elems) {
++          why = "unsupported output shape";
++          return false;
++        }
++
++        auto deco = decorations.find(id);
++
++        if (deco != decorations.end()) {
++          for (const auto& d : deco->second) {
++            switch (d[0]) {
++              case spv::DecorationBuiltIn:
++                v.builtIn = true;
++                v.builtInId = d[1];
++                break;
++              case spv::DecorationLocation:
++                v.hasLocation = true;
++                v.location = d[1];
++                break;
++              case spv::DecorationComponent:
++                v.hasComponent = true;
++                v.component = d[1];
++                break;
++              case spv::DecorationFlat:          v.flat = true; break;
++              case spv::DecorationNoPerspective: v.noPerspective = true; break;
++              case spv::DecorationCentroid:      v.centroid = true; break;
++              case spv::DecorationSample:        v.sample = true; break;
++              case spv::DecorationPatch:
++                why = "patch output in tessellation evaluation shader";
++                return false;
++              default:
++                break;
++            }
++          }
++        }
++
++        if (!v.builtIn && !v.hasLocation) {
++          why = "output without location or built-in";
++          return false;
++        }
++
++        if (v.builtIn && v.builtInId != spv::BuiltInPosition
++         && v.builtInId != spv::BuiltInClipDistance
++         && v.builtInId != spv::BuiltInCullDistance
++         && v.builtInId != spv::BuiltInPointSize) {
++          why = str::format("unsupported built-in output ", v.builtInId);
++          return false;
++        }
++
++        result.push_back(v);
++      }
++
++      if (!entryId || result.empty()) {
++        why = "no entry point or no outputs";
++        return false;
++      }
++
++      return true;
++    }
++
++
++    VkFormat getVertexFormat(uint32_t kind, uint32_t comps) {
++      static const VkFormat formats[3][4] = {
++        { VK_FORMAT_R32_SFLOAT, VK_FORMAT_R32G32_SFLOAT, VK_FORMAT_R32G32B32_SFLOAT, VK_FORMAT_R32G32B32A32_SFLOAT },
++        { VK_FORMAT_R32_SINT,   VK_FORMAT_R32G32_SINT,   VK_FORMAT_R32G32B32_SINT,   VK_FORMAT_R32G32B32A32_SINT },
++        { VK_FORMAT_R32_UINT,   VK_FORMAT_R32G32_UINT,   VK_FORMAT_R32G32B32_UINT,   VK_FORMAT_R32G32B32A32_UINT },
++      };
++
++      return formats[kind][comps - 1u];
++    }
++
++
++    // Adds transform feedback capture of every output to the domain shader
++    std::vector<uint32_t> injectXfb(
++      const uint32_t*       code,
++            size_t          words,
++            uint32_t        entryId,
++      const std::vector<OutVar>& outs,
++            uint32_t        stride) {
++      std::vector<uint32_t> result;
++      result.reserve(words + 8u + outs.size() * 12u);
++      result.insert(result.end(), code, code + 5u);
++
++      // Capability TransformFeedback may go anywhere in the capability list
++      result.push_back((2u << 16u) | spv::OpCapability);
++      result.push_back(spv::CapabilityTransformFeedback);
++
++      bool wroteMode = false;
++      bool wroteDeco = false;
++      size_t i = 5u;
++
++      while (i < words) {
++        uint32_t len = code[i] >> 16u;
++        uint32_t op = code[i] & OpCodeMask;
++
++        if (!wroteMode && !isHeaderOpcode(op)) {
++          result.push_back((3u << 16u) | spv::OpExecutionMode);
++          result.push_back(entryId);
++          result.push_back(spv::ExecutionModeXfb);
++          wroteMode = true;
++        }
++
++        if (!wroteDeco && !isPreTypeOpcode(op)) {
++          for (const auto& v : outs) {
++            result.push_back((4u << 16u) | spv::OpDecorate);
++            result.push_back(v.id);
++            result.push_back(spv::DecorationXfbBuffer);
++            result.push_back(0u);
++
++            result.push_back((4u << 16u) | spv::OpDecorate);
++            result.push_back(v.id);
++            result.push_back(spv::DecorationXfbStride);
++            result.push_back(stride);
++
++            result.push_back((4u << 16u) | spv::OpDecorate);
++            result.push_back(v.id);
++            result.push_back(spv::DecorationOffset);
++            result.push_back(v.xfbOffset);
++          }
++
++          wroteDeco = true;
++        }
++
++        result.insert(result.end(), code + i, code + i + len);
++        i += len;
++      }
++
++      return result;
++    }
++
++
++    // Generates a vertex shader that replays the captured vertices: every
++    // scalar/vector element of every domain shader output becomes a vertex
++    // attribute, and is written to an output with the original decorations.
++    class PassthroughBuilder {
++
++    public:
++
++      std::vector<uint32_t> build(
++        const std::vector<OutVar>&                outs,
++              std::vector<DxvkTessEmuLayout::Attribute>& attributes) {
++        bool needClip = false;
++        bool needCull = false;
++
++        for (const auto& v : outs) {
++          needClip |= v.builtIn && v.builtInId == spv::BuiltInClipDistance;
++          needCull |= v.builtIn && v.builtInId == spv::BuiltInCullDistance;
++        }
++
++        uint32_t voidType = newId();
++        uint32_t fnType = newId();
++        uint32_t mainId = newId();
++        uint32_t labelId = newId();
++
++        std::vector<uint32_t> ifaces;
++        std::vector<uint32_t> body;
++        uint32_t location = 0u;
++
++        struct Copy {
++          uint32_t in;
++          uint32_t out;
++          uint32_t elemType;
++          uint32_t outPtrElemType;
++          bool     isArray;
++          uint32_t index;
++        };
++
++        std::vector<Copy> copies;
++
++        for (const auto& v : outs) {
++          uint32_t elemType = vecType(v.kind, v.comps);
++          uint32_t outType = v.isArray ? arrayType(elemType, v.elems) : elemType;
++          uint32_t outVar = newId();
++          uint32_t outPtr = pointerType(spv::StorageClassOutput, outType);
++          uint32_t outPtrElem = pointerType(spv::StorageClassOutput, elemType);
++
++          m_types.push_back((4u << 16u) | spv::OpVariable);
++          m_types.push_back(outPtr);
++          m_types.push_back(outVar);
++          m_types.push_back(spv::StorageClassOutput);
++
++          ifaces.push_back(outVar);
++
++          if (v.builtIn) {
++            deco(outVar, spv::DecorationBuiltIn, v.builtInId);
++          } else {
++            deco(outVar, spv::DecorationLocation, v.location);
++
++            if (v.hasComponent)
++              deco(outVar, spv::DecorationComponent, v.component);
++          }
++
++          if (v.flat || (!v.builtIn && v.kind != 0u))
++            deco(outVar, spv::DecorationFlat);
++          if (v.noPerspective)
++            deco(outVar, spv::DecorationNoPerspective);
++          if (v.centroid)
++            deco(outVar, spv::DecorationCentroid);
++          if (v.sample)
++            deco(outVar, spv::DecorationSample);
++
++          for (uint32_t e = 0u; e < v.elems; e++) {
++            uint32_t inVar = newId();
++            uint32_t inPtr = pointerType(spv::StorageClassInput, elemType);
++
++            m_types.push_back((4u << 16u) | spv::OpVariable);
++            m_types.push_back(inPtr);
++            m_types.push_back(inVar);
++            m_types.push_back(spv::StorageClassInput);
++
++            ifaces.push_back(inVar);
++            deco(inVar, spv::DecorationLocation, location);
++
++            DxvkTessEmuLayout::Attribute attr = { };
++            attr.location = location;
++            attr.format = getVertexFormat(v.kind, v.comps);
++            attr.offset = v.xfbOffset + e * v.comps * 4u;
++            attributes.push_back(attr);
++
++            location++;
++
++            copies.push_back({ inVar, outVar, elemType, outPtrElem, v.isArray, e });
++          }
++        }
++
++        // Function body
++        for (const auto& c : copies) {
++          uint32_t value = newId();
++          body.push_back((4u << 16u) | spv::OpLoad);
++          body.push_back(c.elemType);
++          body.push_back(value);
++          body.push_back(c.in);
++
++          uint32_t target = c.out;
++
++          if (c.isArray) {
++            uint32_t chain = newId();
++            body.push_back((5u << 16u) | spv::OpAccessChain);
++            body.push_back(c.outPtrElemType);
++            body.push_back(chain);
++            body.push_back(c.out);
++            body.push_back(uintConstant(c.index));
++            target = chain;
++          }
++
++          body.push_back((3u << 16u) | spv::OpStore);
++          body.push_back(target);
++          body.push_back(value);
++        }
++
++        // Assemble the module
++        std::vector<uint32_t> out;
++        out.push_back(spv::MagicNumber);
++        out.push_back(0x00010300u);
++        out.push_back(0u);
++        out.push_back(0u);   // bound, patched below
++        out.push_back(0u);
++
++        auto inst = [&] (uint32_t op, std::initializer_list<uint32_t> operands) {
++          out.push_back((uint32_t(operands.size() + 1u) << 16u) | op);
++          out.insert(out.end(), operands.begin(), operands.end());
++        };
++
++        inst(spv::OpCapability, { spv::CapabilityShader });
++
++        if (needClip)
++          inst(spv::OpCapability, { spv::CapabilityClipDistance });
++        if (needCull)
++          inst(spv::OpCapability, { spv::CapabilityCullDistance });
++
++        inst(spv::OpMemoryModel, { spv::AddressingModelLogical, spv::MemoryModelGLSL450 });
++
++        out.push_back(((5u + uint32_t(ifaces.size())) << 16u) | spv::OpEntryPoint);
++        out.push_back(spv::ExecutionModelVertex);
++        out.push_back(mainId);
++        out.push_back(0x6e69616du);  // "main"
++        out.push_back(0u);
++        out.insert(out.end(), ifaces.begin(), ifaces.end());
++
++        out.insert(out.end(), m_decorations.begin(), m_decorations.end());
++
++        inst(spv::OpTypeVoid, { voidType });
++        inst(spv::OpTypeFunction, { fnType, voidType });
++        out.insert(out.end(), m_scalarTypes.begin(), m_scalarTypes.end());
++        out.insert(out.end(), m_constants.begin(), m_constants.end());
++        out.insert(out.end(), m_derivedTypes.begin(), m_derivedTypes.end());
++        out.insert(out.end(), m_types.begin(), m_types.end());
++
++        inst(spv::OpFunction, { voidType, mainId, spv::FunctionControlMaskNone, fnType });
++        inst(spv::OpLabel, { labelId });
++        out.insert(out.end(), body.begin(), body.end());
++        inst(spv::OpReturn, { });
++        inst(spv::OpFunctionEnd, { });
++
++        out[3] = m_nextId;
++        return out;
++      }
++
++    private:
++
++      uint32_t m_nextId = 1u;
++
++      std::vector<uint32_t> m_decorations;
++      std::vector<uint32_t> m_scalarTypes;
++      std::vector<uint32_t> m_constants;
++      std::vector<uint32_t> m_derivedTypes;
++      std::vector<uint32_t> m_types;       // pointer types and variables
++
++      std::map<uint32_t, uint32_t> m_scalarIds;
++      std::map<std::pair<uint32_t, uint32_t>, uint32_t> m_vecIds;
++      std::map<std::pair<uint32_t, uint32_t>, uint32_t> m_arrayIds;
++      std::map<std::pair<uint32_t, uint32_t>, uint32_t> m_ptrIds;
++      std::map<uint32_t, uint32_t> m_uintConstants;
++
++      uint32_t newId() {
++        return m_nextId++;
++      }
++
++      void deco(uint32_t id, uint32_t decoration) {
++        m_decorations.push_back((3u << 16u) | spv::OpDecorate);
++        m_decorations.push_back(id);
++        m_decorations.push_back(decoration);
++      }
++
++      void deco(uint32_t id, uint32_t decoration, uint32_t value) {
++        m_decorations.push_back((4u << 16u) | spv::OpDecorate);
++        m_decorations.push_back(id);
++        m_decorations.push_back(decoration);
++        m_decorations.push_back(value);
++      }
++
++      uint32_t scalarType(uint32_t kind) {
++        auto entry = m_scalarIds.find(kind);
++
++        if (entry != m_scalarIds.end())
++          return entry->second;
++
++        uint32_t id = newId();
++
++        if (kind == 0u) {
++          m_scalarTypes.push_back((3u << 16u) | spv::OpTypeFloat);
++          m_scalarTypes.push_back(id);
++          m_scalarTypes.push_back(32u);
++        } else {
++          m_scalarTypes.push_back((4u << 16u) | spv::OpTypeInt);
++          m_scalarTypes.push_back(id);
++          m_scalarTypes.push_back(32u);
++          m_scalarTypes.push_back(kind == 1u ? 1u : 0u);
++        }
++
++        m_scalarIds.insert({ kind, id });
++        return id;
++      }
++
++      uint32_t uintConstant(uint32_t value) {
++        auto entry = m_uintConstants.find(value);
++
++        if (entry != m_uintConstants.end())
++          return entry->second;
++
++        uint32_t type = scalarType(2u);
++        uint32_t id = newId();
++
++        m_constants.push_back((4u << 16u) | spv::OpConstant);
++        m_constants.push_back(type);
++        m_constants.push_back(id);
++        m_constants.push_back(value);
++
++        m_uintConstants.insert({ value, id });
++        return id;
++      }
++
++      uint32_t vecType(uint32_t kind, uint32_t comps) {
++        uint32_t scalar = scalarType(kind);
++
++        if (comps == 1u)
++          return scalar;
++
++        auto key = std::make_pair(kind, comps);
++        auto entry = m_vecIds.find(key);
++
++        if (entry != m_vecIds.end())
++          return entry->second;
++
++        uint32_t id = newId();
++
++        m_derivedTypes.push_back((4u << 16u) | spv::OpTypeVector);
++        m_derivedTypes.push_back(id);
++        m_derivedTypes.push_back(scalar);
++        m_derivedTypes.push_back(comps);
++
++        m_vecIds.insert({ key, id });
++        return id;
++      }
++
++      uint32_t arrayType(uint32_t elem, uint32_t length) {
++        auto key = std::make_pair(elem, length);
++        auto entry = m_arrayIds.find(key);
++
++        if (entry != m_arrayIds.end())
++          return entry->second;
++
++        uint32_t lengthId = uintConstant(length);
++        uint32_t id = newId();
++
++        m_derivedTypes.push_back((4u << 16u) | spv::OpTypeArray);
++        m_derivedTypes.push_back(id);
++        m_derivedTypes.push_back(elem);
++        m_derivedTypes.push_back(lengthId);
++
++        m_arrayIds.insert({ key, id });
++        return id;
++      }
++
++      uint32_t pointerType(uint32_t storage, uint32_t pointee) {
++        auto key = std::make_pair(storage, pointee);
++        auto entry = m_ptrIds.find(key);
++
++        if (entry != m_ptrIds.end())
++          return entry->second;
++
++        uint32_t id = newId();
++
++        m_derivedTypes.push_back((4u << 16u) | spv::OpTypePointer);
++        m_derivedTypes.push_back(id);
++        m_derivedTypes.push_back(storage);
++        m_derivedTypes.push_back(pointee);
++
++        m_ptrIds.insert({ key, id });
++        return id;
++      }
++
++    };
++
++
++    uint32_t findMemoryType(const VkPhysicalDeviceMemoryProperties& props, uint32_t bits, VkMemoryPropertyFlags want) {
++      for (uint32_t i = 0u; i < props.memoryTypeCount; i++) {
++        if ((bits & (1u << i)) && (props.memoryTypes[i].propertyFlags & want) == want)
++          return i;
++      }
++
++      return ~0u;
++    }
++
++    constexpr VkDeviceSize alignUp(VkDeviceSize v, VkDeviceSize a) {
++      return (v + a - 1u) & ~(a - 1u);
++    }
++
++  }
++
++
++  // ----------------------------------------------------------------------
++  // Emulator
++  // ----------------------------------------------------------------------
++
++  DxvkTessEmu::DxvkTessEmu() {
++
++  }
++
++
++  DxvkTessEmu& DxvkTessEmu::get() {
++    static DxvkTessEmu instance;
++    return instance;
++  }
++
++
++  bool DxvkTessEmu::init() {
++    m_vkl = new vk::LibraryFn();
++
++    if (!m_vkl->getLoaderProc()) {
++      Logger::err("BVMTESS: no Vulkan loader");
++      return false;
++    }
++
++    // Find the lavapipe ICD
++    std::string icd;
++
++    if (const char* e = std::getenv("BVM_TESSEMU_ICD"))
++      icd = e;
++
++    if (icd.empty()) {
++      static const char* candidates[] = {
++        "/usr/share/vulkan/icd.d/lvp_icd.aarch64.json",
++        "/usr/share/vulkan/icd.d/lvp_icd.json",
++        "/usr/local/share/vulkan/icd.d/lvp_icd.json",
++      };
++
++      for (auto c : candidates) {
++        if (!access(c, R_OK)) {
++          icd = c;
++          break;
++        }
++      }
++    }
++
++    if (icd.empty()) {
++      Logger::err("BVMTESS: lavapipe ICD json not found (set BVM_TESSEMU_ICD)");
++      return false;
++    }
++
++    // The loader reads the driver list when the instance is created, so point
++    // it at lavapipe only for this call.
++    const char* oldDrivers = std::getenv("VK_DRIVER_FILES");
++    std::string oldDriversCopy = oldDrivers ? oldDrivers : "";
++    const char* oldIcd = std::getenv("VK_ICD_FILENAMES");
++    std::string oldIcdCopy = oldIcd ? oldIcd : "";
++
++    setenv("VK_DRIVER_FILES", icd.c_str(), 1);
++    unsetenv("VK_ICD_FILENAMES");
++
++    VkApplicationInfo appInfo = { VK_STRUCTURE_TYPE_APPLICATION_INFO };
++    appInfo.pApplicationName = "dxvk-tessemu";
++    appInfo.apiVersion = VK_API_VERSION_1_3;
++
++    VkInstanceCreateInfo instInfo = { VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO };
++    instInfo.pApplicationInfo = &appInfo;
++
++    VkResult vr = m_vkl->vkCreateInstance(&instInfo, nullptr, &m_instance);
++
++    if (oldDrivers)
++      setenv("VK_DRIVER_FILES", oldDriversCopy.c_str(), 1);
++    else
++      unsetenv("VK_DRIVER_FILES");
++
++    if (oldIcd)
++      setenv("VK_ICD_FILENAMES", oldIcdCopy.c_str(), 1);
++
++    if (vr != VK_SUCCESS) {
++      Logger::err(str::format("BVMTESS: vkCreateInstance failed: ", vr));
++      return false;
++    }
++
++    m_vki = new vk::InstanceFn(m_vkl, false, m_instance);
++
++    uint32_t count = 0u;
++    m_vki->vkEnumeratePhysicalDevices(m_instance, &count, nullptr);
++    std::vector<VkPhysicalDevice> devices(count);
++    m_vki->vkEnumeratePhysicalDevices(m_instance, &count, devices.data());
++
++    for (auto d : devices) {
++      VkPhysicalDeviceProperties props = { };
++      m_vki->vkGetPhysicalDeviceProperties(d, &props);
++
++      Logger::warn(str::format("BVMTESS: candidate device ", props.deviceName, " type ", uint32_t(props.deviceType)));
++
++      if (props.deviceType == VK_PHYSICAL_DEVICE_TYPE_CPU) {
++        m_physical = d;
++        m_uboAlign = std::max<VkDeviceSize>(props.limits.minUniformBufferOffsetAlignment, 256u);
++        Logger::warn(str::format("BVMTESS: using ", props.deviceName));
++        break;
++      }
++    }
++
++    if (!m_physical) {
++      Logger::err("BVMTESS: no CPU (lavapipe) Vulkan device visible; the loader may have ignored VK_DRIVER_FILES");
++      return false;
++    }
++
++    m_vki->vkGetPhysicalDeviceMemoryProperties(m_physical, &m_memory);
++
++    VkPhysicalDeviceTransformFeedbackFeaturesEXT xfb = { VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_TRANSFORM_FEEDBACK_FEATURES_EXT };
++    VkPhysicalDeviceVulkan13Features f13 = { VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_3_FEATURES };
++    VkPhysicalDeviceVulkan12Features f12 = { VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES };
++    VkPhysicalDeviceFeatures2 f2 = { VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2 };
++    f13.pNext = &xfb;
++    f12.pNext = &f13;
++    f2.pNext = &f12;
++
++    m_vki->vkGetPhysicalDeviceFeatures2(m_physical, &f2);
++
++    if (!f2.features.tessellationShader || !xfb.transformFeedback || !f13.dynamicRendering) {
++      Logger::err("BVMTESS: lavapipe lacks tessellation / transform feedback / dynamic rendering");
++      return false;
++    }
++
++    const char* exts[] = { VK_EXT_TRANSFORM_FEEDBACK_EXTENSION_NAME };
++    float prio = 1.0f;
++
++    VkDeviceQueueCreateInfo queueInfo = { VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO };
++    queueInfo.queueFamilyIndex = 0u;
++    queueInfo.queueCount = 1u;
++    queueInfo.pQueuePriorities = &prio;
++
++    VkDeviceCreateInfo devInfo = { VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO };
++    devInfo.pNext = &f2;
++    devInfo.queueCreateInfoCount = 1u;
++    devInfo.pQueueCreateInfos = &queueInfo;
++    devInfo.enabledExtensionCount = 1u;
++    devInfo.ppEnabledExtensionNames = exts;
++
++    vr = m_vki->vkCreateDevice(m_physical, &devInfo, nullptr, &m_device);
++
++    if (vr != VK_SUCCESS) {
++      Logger::err(str::format("BVMTESS: vkCreateDevice failed: ", vr));
++      return false;
++    }
++
++    m_vkd = new vk::DeviceFn(m_vki, false, m_device);
++    m_vkd->vkGetDeviceQueue(m_device, 0u, 0u, &m_queue);
++
++    VkCommandPoolCreateInfo poolInfo = { VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO };
++    poolInfo.flags = VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT;
++    poolInfo.queueFamilyIndex = 0u;
++
++    if (m_vkd->vkCreateCommandPool(m_device, &poolInfo, nullptr, &m_cmdPool) != VK_SUCCESS)
++      return false;
++
++    VkCommandBufferAllocateInfo cmdInfo = { VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO };
++    cmdInfo.commandPool = m_cmdPool;
++    cmdInfo.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
++    cmdInfo.commandBufferCount = 1u;
++
++    if (m_vkd->vkAllocateCommandBuffers(m_device, &cmdInfo, &m_cmd) != VK_SUCCESS)
++      return false;
++
++    std::array<VkDescriptorPoolSize, 2> poolSizes = {{
++      { VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 64u },
++      { VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 64u },
++    }};
++
++    VkDescriptorPoolCreateInfo descPoolInfo = { VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO };
++    descPoolInfo.maxSets = 4u;
++    descPoolInfo.poolSizeCount = poolSizes.size();
++    descPoolInfo.pPoolSizes = poolSizes.data();
++
++    if (m_vkd->vkCreateDescriptorPool(m_device, &descPoolInfo, nullptr, &m_descPool) != VK_SUCCESS)
++      return false;
++
++    return true;
++  }
++
++
++  bool DxvkTessEmu::ensureBuffer(VkDeviceSize size, std::string& why) {
++    if (size <= m_bufferSize)
++      return true;
++
++    if (m_buffer) {
++      m_vkd->vkUnmapMemory(m_device, m_bufferMem);
++      m_vkd->vkDestroyBuffer(m_device, m_buffer, nullptr);
++      m_vkd->vkFreeMemory(m_device, m_bufferMem, nullptr);
++      m_buffer = VK_NULL_HANDLE;
++      m_bufferMem = VK_NULL_HANDLE;
++      m_bufferSize = 0u;
++      m_bufferMap = nullptr;
++    }
++
++    VkDeviceSize newSize = std::max<VkDeviceSize>(size, 4u << 20u);
++
++    VkBufferCreateInfo info = { VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO };
++    info.size = newSize;
++    info.usage = VK_BUFFER_USAGE_VERTEX_BUFFER_BIT
++               | VK_BUFFER_USAGE_INDEX_BUFFER_BIT
++               | VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT
++               | VK_BUFFER_USAGE_STORAGE_BUFFER_BIT
++               | VK_BUFFER_USAGE_TRANSFORM_FEEDBACK_BUFFER_BIT_EXT
++               | VK_BUFFER_USAGE_TRANSFORM_FEEDBACK_COUNTER_BUFFER_BIT_EXT;
++    info.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
++
++    if (m_vkd->vkCreateBuffer(m_device, &info, nullptr, &m_buffer) != VK_SUCCESS) {
++      why = "vkCreateBuffer failed";
++      return false;
++    }
++
++    VkMemoryRequirements req = { };
++    m_vkd->vkGetBufferMemoryRequirements(m_device, m_buffer, &req);
++
++    uint32_t type = findMemoryType(m_memory, req.memoryTypeBits,
++      VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
++
++    if (type == ~0u) {
++      why = "no host-visible memory type";
++      return false;
++    }
++
++    VkMemoryAllocateInfo alloc = { VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO };
++    alloc.allocationSize = req.size;
++    alloc.memoryTypeIndex = type;
++
++    if (m_vkd->vkAllocateMemory(m_device, &alloc, nullptr, &m_bufferMem) != VK_SUCCESS
++     || m_vkd->vkBindBufferMemory(m_device, m_buffer, m_bufferMem, 0u) != VK_SUCCESS
++     || m_vkd->vkMapMemory(m_device, m_bufferMem, 0u, VK_WHOLE_SIZE, 0u, reinterpret_cast<void**>(&m_bufferMap)) != VK_SUCCESS) {
++      why = "buffer memory allocation failed";
++      return false;
++    }
++
++    m_bufferSize = newSize;
++    return true;
++  }
++
++
++  bool DxvkTessEmu::createPipe(Pipe& pipe, const DxvkTessEmuRequest& rq, std::string& why) {
++    // Assign emulator bindings and gather the resource layout of all stages
++    DxvkShaderBindingMap map;
++    uint32_t nextBinding = 0u;
++
++    struct StageInfo {
++      VkShaderStageFlagBits stage;
++      Rc<DxvkShader> shader;
++      const DxvkShaderLinkage* linkage;
++    };
++
++    const std::array<StageInfo, 3> stages = {{
++      { VK_SHADER_STAGE_VERTEX_BIT,                  rq.vs,  &rq.vsLinkage  },
++      { VK_SHADER_STAGE_TESSELLATION_CONTROL_BIT,    rq.tcs, &rq.tcsLinkage },
++      { VK_SHADER_STAGE_TESSELLATION_EVALUATION_BIT, rq.tes, &rq.tesLinkage },
++    }};
++
++    for (const auto& s : stages) {
++      DxvkPipelineLayoutBuilder layout = s.shader->getLayout();
++
++      if (layout.getSamplerHeapBindingCount()) {
++        why = str::format("stage ", uint32_t(s.stage), " uses samplers");
++        return false;
++      }
++
++      auto range = layout.getBindings();
++
++      for (size_t i = 0u; i < range.bindingCount; i++) {
++        const DxvkShaderDescriptor& d = range.bindings[i];
++        VkDescriptorType type = d.getDescriptorType();
++
++        if (!d.usesDescriptor()
++         || (type != VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER && type != VK_DESCRIPTOR_TYPE_STORAGE_BUFFER)) {
++          why = str::format("stage ", uint32_t(s.stage), " uses unsupported resource (type ", uint32_t(type),
++            ", set ", d.getSet(), ", binding ", d.getBinding(), ")");
++          return false;
++        }
++
++        BindingEntry entry = { };
++        entry.stage = s.stage;
++        entry.desc = d;
++        entry.type = type;
++        entry.binding = nextBinding++;
++        pipe.entries.push_back(entry);
++
++        map.addBinding(
++          DxvkShaderBinding(s.stage, d.getSet(), d.getBinding()),
++          DxvkShaderBinding(s.stage, 0u, entry.binding));
++      }
++
++      // Built-ins live at offset 0 of the shared push data block
++      map.addPushData(DxvkPushDataBlock(s.stage, 0u, 128u, 4u, 0u), 0u);
++    }
++
++    // Get the final SPIR-V
++    std::array<SpirvCodeBuffer, 3> codes = {{
++      rq.vs->getCode(&map, &rq.vsLinkage),
++      rq.tcs->getCode(&map, &rq.tcsLinkage),
++      rq.tes->getCode(&map, &rq.tesLinkage),
++    }};
++
++    // Analyze and rewrite the domain shader
++    std::vector<OutVar> outs;
++    uint32_t entryId = 0u;
++
++    if (!analyzeOutputs(codes[2].data(), codes[2].dwords(), outs, entryId, why))
++      return false;
++
++    uint32_t stride = 0u;
++
++    for (auto& v : outs) {
++      v.xfbOffset = stride;
++      stride += v.elems * v.comps * 4u;
++    }
++
++    auto layout = std::make_shared<DxvkTessEmuLayout>();
++    layout->stride = stride;
++
++    VkPrimitiveTopology topology = rq.tes->metadata().outputTopology;
++
++    if (topology == VK_PRIMITIVE_TOPOLOGY_MAX_ENUM)
++      topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
++
++    if (topology != VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST
++     && topology != VK_PRIMITIVE_TOPOLOGY_LINE_LIST
++     && topology != VK_PRIMITIVE_TOPOLOGY_POINT_LIST) {
++      why = str::format("unsupported tessellator output topology ", uint32_t(topology));
++      return false;
++    }
++
++    layout->topology = topology;
++
++    std::vector<uint32_t> tesXfb = injectXfb(codes[2].data(), codes[2].dwords(), entryId, outs, stride);
++
++    PassthroughBuilder builder;
++    std::vector<uint32_t> passCode = builder.build(outs, layout->attributes);
++
++    if (layout->attributes.size() > 16u) {
++      why = "too many output attributes for pass-through shader";
++      return false;
++    }
++
++    {
++      DxvkSpirvShaderCreateInfo info = { };
++      info.debugName = "bvm_tessemu_passthrough";
++      layout->passthroughVs = new DxvkSpirvShader(info, SpirvCodeBuffer(std::move(passCode)));
++    }
++
++    // Vulkan objects
++    auto makeModule = [&] (const uint32_t* code, size_t words, VkShaderModule& module) {
++      VkShaderModuleCreateInfo info = { VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO };
++      info.codeSize = words * sizeof(uint32_t);
++      info.pCode = code;
++      return m_vkd->vkCreateShaderModule(m_device, &info, nullptr, &module) == VK_SUCCESS;
++    };
++
++    if (!makeModule(codes[0].data(), codes[0].dwords(), pipe.vs)
++     || !makeModule(codes[1].data(), codes[1].dwords(), pipe.tcs)
++     || !makeModule(tesXfb.data(), tesXfb.size(), pipe.tes)) {
++      why = "vkCreateShaderModule failed";
++      return false;
++    }
++
++    std::vector<VkDescriptorSetLayoutBinding> bindings;
++
++    for (const auto& e : pipe.entries) {
++      VkDescriptorSetLayoutBinding b = { };
++      b.binding = e.binding;
++      b.descriptorType = e.type;
++      b.descriptorCount = 1u;
++      b.stageFlags = VK_SHADER_STAGE_ALL_GRAPHICS;
++      bindings.push_back(b);
++    }
++
++    VkDescriptorSetLayoutCreateInfo setInfo = { VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO };
++    setInfo.bindingCount = bindings.size();
++    setInfo.pBindings = bindings.data();
++
++    if (m_vkd->vkCreateDescriptorSetLayout(m_device, &setInfo, nullptr, &pipe.setLayout) != VK_SUCCESS) {
++      why = "vkCreateDescriptorSetLayout failed";
++      return false;
++    }
++
++    VkPushConstantRange pushRange = { VK_SHADER_STAGE_ALL_GRAPHICS, 0u, 128u };
++
++    VkPipelineLayoutCreateInfo layoutInfo = { VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO };
++    layoutInfo.setLayoutCount = 1u;
++    layoutInfo.pSetLayouts = &pipe.setLayout;
++    layoutInfo.pushConstantRangeCount = 1u;
++    layoutInfo.pPushConstantRanges = &pushRange;
++
++    if (m_vkd->vkCreatePipelineLayout(m_device, &layoutInfo, nullptr, &pipe.layout) != VK_SUCCESS) {
++      why = "vkCreatePipelineLayout failed";
++      return false;
++    }
++
++    std::array<VkPipelineShaderStageCreateInfo, 3> stageInfos = { };
++    const std::array<std::pair<VkShaderStageFlagBits, VkShaderModule>, 3> mods = {{
++      { VK_SHADER_STAGE_VERTEX_BIT, pipe.vs },
++      { VK_SHADER_STAGE_TESSELLATION_CONTROL_BIT, pipe.tcs },
++      { VK_SHADER_STAGE_TESSELLATION_EVALUATION_BIT, pipe.tes },
++    }};
++
++    for (size_t i = 0u; i < 3u; i++) {
++      stageInfos[i].sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
++      stageInfos[i].stage = mods[i].first;
++      stageInfos[i].module = mods[i].second;
++      stageInfos[i].pName = "main";
++    }
++
++    VkPipelineVertexInputStateCreateInfo viInfo = { VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO };
++    viInfo.vertexBindingDescriptionCount = rq.bindings.size();
++    viInfo.pVertexBindingDescriptions = rq.bindings.data();
++    viInfo.vertexAttributeDescriptionCount = rq.attributes.size();
++    viInfo.pVertexAttributeDescriptions = rq.attributes.data();
++
++    VkPipelineInputAssemblyStateCreateInfo iaInfo = { VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO };
++    iaInfo.topology = VK_PRIMITIVE_TOPOLOGY_PATCH_LIST;
++
++    VkPipelineTessellationStateCreateInfo tessInfo = { VK_STRUCTURE_TYPE_PIPELINE_TESSELLATION_STATE_CREATE_INFO };
++    tessInfo.patchControlPoints = rq.patchControlPoints;
++
++    VkViewport viewport = { 0.0f, 0.0f, 64.0f, 64.0f, 0.0f, 1.0f };
++    VkRect2D scissor = { { 0, 0 }, { 64u, 64u } };
++
++    VkPipelineViewportStateCreateInfo vpInfo = { VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO };
++    vpInfo.viewportCount = 1u;
++    vpInfo.pViewports = &viewport;
++    vpInfo.scissorCount = 1u;
++    vpInfo.pScissors = &scissor;
++
++    VkPipelineRasterizationStateCreateInfo rsInfo = { VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO };
++    rsInfo.rasterizerDiscardEnable = VK_TRUE;
++    rsInfo.polygonMode = VK_POLYGON_MODE_FILL;
++    rsInfo.cullMode = VK_CULL_MODE_NONE;
++    rsInfo.lineWidth = 1.0f;
++
++    VkPipelineMultisampleStateCreateInfo msInfo = { VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO };
++    msInfo.rasterizationSamples = VK_SAMPLE_COUNT_1_BIT;
++
++    VkPipelineRenderingCreateInfo renderInfo = { VK_STRUCTURE_TYPE_PIPELINE_RENDERING_CREATE_INFO };
++
++    VkGraphicsPipelineCreateInfo pipeInfo = { VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO };
++    pipeInfo.pNext = &renderInfo;
++    pipeInfo.stageCount = stageInfos.size();
++    pipeInfo.pStages = stageInfos.data();
++    pipeInfo.pVertexInputState = &viInfo;
++    pipeInfo.pInputAssemblyState = &iaInfo;
++    pipeInfo.pTessellationState = &tessInfo;
++    pipeInfo.pViewportState = &vpInfo;
++    pipeInfo.pRasterizationState = &rsInfo;
++    pipeInfo.pMultisampleState = &msInfo;
++    pipeInfo.layout = pipe.layout;
++
++    VkResult vr = m_vkd->vkCreateGraphicsPipelines(m_device, VK_NULL_HANDLE, 1u, &pipeInfo, nullptr, &pipe.pipeline);
++
++    if (vr != VK_SUCCESS) {
++      why = str::format("lavapipe vkCreateGraphicsPipelines failed: ", vr);
++      return false;
++    }
++
++    pipe.outLayout = layout;
++    return true;
++  }
++
++
++  DxvkTessEmu::Pipe* DxvkTessEmu::getPipe(const DxvkTessEmuRequest& rq, std::string& why) {
++    DxvkHashState hash;
++
++    for (const auto& a : rq.attributes) {
++      hash.add(a.location);
++      hash.add(a.binding);
++      hash.add(uint32_t(a.format));
++      hash.add(a.offset);
++    }
++
++    for (const auto& b : rq.bindings) {
++      hash.add(b.binding);
++      hash.add(b.stride);
++      hash.add(uint32_t(b.inputRate));
++    }
++
++    std::string key = str::format(
++      DxvkShader::getCookie(rq.vs), ":", DxvkShader::getCookie(rq.tcs), ":",
++      DxvkShader::getCookie(rq.tes), ":", rq.patchControlPoints, ":", size_t(hash),
++      ":", rq.tesLinkage.hash(), ":", rq.tcsLinkage.hash(), ":", rq.vsLinkage.hash());
++
++    auto entry = m_pipes.find(key);
++
++    if (entry != m_pipes.end()) {
++      if (!entry->second) {
++        why = "pipeline creation failed earlier";
++        return nullptr;
++      }
++
++      return entry->second.get();
++    }
++
++    auto pipe = std::make_unique<Pipe>();
++
++    if (!createPipe(*pipe, rq, why)) {
++      Logger::err(str::format("BVMTESS: cannot create lavapipe pipeline: ", why));
++      m_pipes.emplace(key, nullptr);
++      return nullptr;
++    }
++
++    Logger::warn(str::format("BVMTESS: created lavapipe pipeline ", key, " (", pipe->entries.size(),
++      " descriptors, stride ", pipe->outLayout->stride, ", ", pipe->outLayout->attributes.size(), " attributes)"));
++
++    Pipe* result = pipe.get();
++    m_pipes.emplace(key, std::move(pipe));
++    return result;
++  }
++
++
++  bool DxvkTessEmu::run(const DxvkTessEmuRequest& rq, DxvkTessEmuOutput& output, std::string& why) {
++    std::lock_guard<std::mutex> lock(m_mutex);
++
++    if (!m_initialized) {
++      m_initialized = true;
++      m_ok = init();
++    }
++
++    if (!m_ok) {
++      why = "lavapipe device unavailable";
++      return false;
++    }
++
++    Pipe* pipe = getPipe(rq, why);
++
++    if (!pipe)
++      return false;
++
++    const auto& layout = *pipe->outLayout;
++
++    // --- Work out which vertex ranges the draw reads --------------------
++    struct Copy {
++      uint32_t binding;
++      size_t   srcOffset;
++      size_t   bytes;
++      VkDeviceSize dst;
++    };
++
++    std::vector<Copy> copies;
++    std::set<uint32_t> usedBindings;
++
++    for (const auto& a : rq.attributes)
++      usedBindings.insert(a.binding);
++
++    int32_t drawVertexOffset = 0;
++    uint32_t minIndex = 0u, maxIndex = 0u;
++    size_t indexBytes = 0u;
++    const uint8_t* indexSrc = nullptr;
++
++    if (rq.indexed) {
++      uint32_t isz = rq.indexType == VK_INDEX_TYPE_UINT16 ? 2u : (rq.indexType == VK_INDEX_TYPE_UINT32 ? 4u : 0u);
++
++      if (!isz) {
++        why = "unsupported index type";
++        return false;
++      }
++
++      indexBytes = size_t(rq.count) * isz;
++
++      if (!rq.indexData || (size_t(rq.first) + rq.count) * isz > rq.indexSize) {
++        why = "index buffer not CPU readable or out of range";
++        return false;
++      }
++
++      indexSrc = rq.indexData + size_t(rq.first) * isz;
++      minIndex = ~0u;
++      maxIndex = 0u;
++
++      for (uint32_t i = 0u; i < rq.count; i++) {
++        uint32_t idx = isz == 2u
++          ? reinterpret_cast<const uint16_t*>(indexSrc)[i]
++          : reinterpret_cast<const uint32_t*>(indexSrc)[i];
++
++        minIndex = std::min(minIndex, idx);
++        maxIndex = std::max(maxIndex, idx);
++      }
++    }
++
++    VkDeviceSize cursor = 256u;  // the first 256 bytes hold the XFB counter
++
++    for (const auto& b : rq.bindings) {
++      if (!usedBindings.count(b.binding))
++        continue;
++
++      const auto& vb = rq.vertexBuffers[b.binding];
++
++      uint64_t lo, cnt;
++
++      if (b.inputRate == VK_VERTEX_INPUT_RATE_INSTANCE) {
++        lo = rq.firstInstance;
++        cnt = 1u;
++      } else if (rq.indexed) {
++        int64_t first = int64_t(minIndex) + rq.vertexOffset;
++
++        if (first < 0) {
++          why = "negative vertex index";
++          return false;
++        }
++
++        lo = uint64_t(first);
++        cnt = uint64_t(maxIndex) - minIndex + 1u;
++      } else {
++        lo = rq.first;
++        cnt = rq.count;
++      }
++
++      if (!vb.data || (lo + cnt) * b.stride > vb.size) {
++        why = str::format("vertex buffer ", b.binding, " not CPU readable or out of range");
++        return false;
++      }
++
++      cursor = alignUp(cursor, 16u);
++      copies.push_back({ b.binding, size_t(lo * b.stride), size_t(cnt * b.stride), cursor });
++      cursor += cnt * b.stride;
++
++      if (rq.indexed && b.inputRate == VK_VERTEX_INPUT_RATE_VERTEX)
++        drawVertexOffset = rq.vertexOffset - int32_t(lo);
++    }
++
++    VkDeviceSize indexDst = 0u;
++
++    if (rq.indexed) {
++      cursor = alignUp(cursor, 16u);
++      indexDst = cursor;
++      cursor += indexBytes;
++    }
++
++    // Resources
++    struct ResCopy {
++      const uint8_t* data;
++      size_t size;
++      VkDeviceSize dst;
++    };
++
++    std::vector<ResCopy> resCopies;
++
++    for (const auto& e : pipe->entries) {
++      const uint8_t* data = nullptr;
++      size_t size = 0u;
++
++      if (!rq.resolver || !rq.resolver(e.stage, e.desc, data, size) || !data || !size) {
++        why = str::format("cannot read resource (stage ", uint32_t(e.stage), ", set ", e.desc.getSet(),
++          ", binding ", e.desc.getBinding(), ", index ", e.desc.getResourceIndex(), ")");
++        return false;
++      }
++
++      if (size > (16u << 20u)) {
++        why = "resource too large";
++        return false;
++      }
++
++      cursor = alignUp(cursor, m_uboAlign);
++      resCopies.push_back({ data, size, cursor });
++      cursor += alignUp(size, 16u);
++    }
++
++    // Transform feedback output
++    uint32_t patches = std::max(1u, rq.count / std::max(1u, rq.patchControlPoints));
++    VkDeviceSize xfbCapacity = std::clamp<VkDeviceSize>(
++      VkDeviceSize(patches) * layout.stride * 400u, 256u << 10u, 32u << 20u);
++
++    for (uint32_t attempt = 0u; attempt < 4u; attempt++) {
++      VkDeviceSize xfbOffset = alignUp(cursor, 256u);
++      VkDeviceSize total = xfbOffset + xfbCapacity;
++
++      if (!ensureBuffer(total, why))
++        return false;
++
++      uint8_t* map = m_bufferMap;
++      std::memset(map, 0, 256u);
++
++      for (const auto& c : copies) {
++        const auto& vb = rq.vertexBuffers[c.binding];
++        std::memcpy(map + c.dst, vb.data + c.srcOffset, c.bytes);
++      }
++
++      if (rq.indexed)
++        std::memcpy(map + indexDst, indexSrc, indexBytes);
++
++      for (const auto& r : resCopies)
++        std::memcpy(map + r.dst, r.data, r.size);
++
++      // Descriptors
++      m_vkd->vkResetDescriptorPool(m_device, m_descPool, 0u);
++
++      VkDescriptorSet set = VK_NULL_HANDLE;
++
++      VkDescriptorSetAllocateInfo setAlloc = { VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO };
++      setAlloc.descriptorPool = m_descPool;
++      setAlloc.descriptorSetCount = 1u;
++      setAlloc.pSetLayouts = &pipe->setLayout;
++
++      if (m_vkd->vkAllocateDescriptorSets(m_device, &setAlloc, &set) != VK_SUCCESS) {
++        why = "vkAllocateDescriptorSets failed";
++        return false;
++      }
++
++      std::vector<VkDescriptorBufferInfo> bufInfos(pipe->entries.size());
++      std::vector<VkWriteDescriptorSet> writes(pipe->entries.size());
++
++      for (size_t i = 0u; i < pipe->entries.size(); i++) {
++        bufInfos[i] = { m_buffer, resCopies[i].dst, alignUp(resCopies[i].size, 16u) };
++
++        writes[i] = { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET };
++        writes[i].dstSet = set;
++        writes[i].dstBinding = pipe->entries[i].binding;
++        writes[i].descriptorCount = 1u;
++        writes[i].descriptorType = pipe->entries[i].type;
++        writes[i].pBufferInfo = &bufInfos[i];
++      }
++
++      if (!writes.empty())
++        m_vkd->vkUpdateDescriptorSets(m_device, writes.size(), writes.data(), 0u, nullptr);
++
++      // Record
++      m_vkd->vkResetCommandBuffer(m_cmd, 0u);
++
++      VkCommandBufferBeginInfo beginInfo = { VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO };
++      beginInfo.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
++      m_vkd->vkBeginCommandBuffer(m_cmd, &beginInfo);
++
++      VkRenderingInfo renderInfo = { VK_STRUCTURE_TYPE_RENDERING_INFO };
++      renderInfo.renderArea = { { 0, 0 }, { 64u, 64u } };
++      renderInfo.layerCount = 1u;
++
++      m_vkd->vkCmdBeginRendering(m_cmd, &renderInfo);
++      m_vkd->vkCmdBindPipeline(m_cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, pipe->pipeline);
++
++      std::array<uint32_t, 32> push = { };
++      push[0] = rq.builtIns;
++      m_vkd->vkCmdPushConstants(m_cmd, pipe->layout, VK_SHADER_STAGE_ALL_GRAPHICS, 0u, 128u, push.data());
++
++      m_vkd->vkCmdBindDescriptorSets(m_cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, pipe->layout, 0u, 1u, &set, 0u, nullptr);
++
++      for (const auto& c : copies) {
++        VkDeviceSize offset = c.dst;
++        m_vkd->vkCmdBindVertexBuffers(m_cmd, c.binding, 1u, &m_buffer, &offset);
++      }
++
++      if (rq.indexed)
++        m_vkd->vkCmdBindIndexBuffer(m_cmd, m_buffer, indexDst, rq.indexType);
++
++      VkDeviceSize xfbOff = xfbOffset;
++      VkDeviceSize xfbSize = xfbCapacity;
++      m_vkd->vkCmdBindTransformFeedbackBuffersEXT(m_cmd, 0u, 1u, &m_buffer, &xfbOff, &xfbSize);
++      m_vkd->vkCmdBeginTransformFeedbackEXT(m_cmd, 0u, 0u, nullptr, nullptr);
++
++      if (rq.indexed)
++        m_vkd->vkCmdDrawIndexed(m_cmd, rq.count, 1u, 0u, drawVertexOffset, 0u);
++      else
++        m_vkd->vkCmdDraw(m_cmd, rq.count, 1u, 0u, 0u);
++
++      VkDeviceSize counterOff = 0u;
++      m_vkd->vkCmdEndTransformFeedbackEXT(m_cmd, 0u, 1u, &m_buffer, &counterOff);
++      m_vkd->vkCmdEndRendering(m_cmd);
++      m_vkd->vkEndCommandBuffer(m_cmd);
++
++      VkSubmitInfo submit = { VK_STRUCTURE_TYPE_SUBMIT_INFO };
++      submit.commandBufferCount = 1u;
++      submit.pCommandBuffers = &m_cmd;
++
++      if (m_vkd->vkQueueSubmit(m_queue, 1u, &submit, VK_NULL_HANDLE) != VK_SUCCESS
++       || m_vkd->vkQueueWaitIdle(m_queue) != VK_SUCCESS) {
++        why = "lavapipe submit failed";
++        return false;
++      }
++
++      uint32_t bytes;
++      std::memcpy(&bytes, map, sizeof(bytes));
++
++      if (VkDeviceSize(bytes) + 3u * layout.stride >= xfbCapacity) {
++        // Possibly truncated, retry with more room
++        xfbCapacity *= 4u;
++
++        if (xfbCapacity > (128u << 20u)) {
++          why = "tessellation output too large";
++          return false;
++        }
++
++        continue;
++      }
++
++      uint32_t vertices = bytes / layout.stride;
++      vertices -= vertices % 3u;
++
++      if (layout.topology == VK_PRIMITIVE_TOPOLOGY_LINE_LIST)
++        vertices &= ~1u;
++
++      output.layout = pipe->outLayout;
++      output.vertexCount = vertices;
++      output.vertices.assign(map + xfbOffset, map + xfbOffset + size_t(vertices) * layout.stride);
++      return true;
++    }
++
++    why = "tessellation output too large";
++    return false;
++  }
++
++}
+diff --git a/src/dxvk/dxvk_tessemu.h b/src/dxvk/dxvk_tessemu.h
+new file mode 100644
+index 00000000..11212978
+--- /dev/null
++++ b/src/dxvk/dxvk_tessemu.h
+@@ -0,0 +1,192 @@
++#pragma once
++
++// BVM-GPU: tessellation emulation for devices without tessellationShader (V3D).
++//
++// The tessellation stages (VS + HS + fixed-function tessellator + DS) of a draw
++// are executed on lavapipe (llvmpipe) with rasterizer discard, and the tessellated
++// triangles are captured with VK_EXT_transform_feedback. The caller then draws the
++// captured vertices on the real device with a generated pass-through vertex shader
++// and the application's own fragment shader.
++//
++// See ~/bvm-gpu/README.md (item 51) and ~/bvm-gpu/tessemu-test/ for the standalone
++// feasibility test this is based on.
++
++#include <functional>
++#include <memory>
++#include <mutex>
++#include <string>
++#include <unordered_map>
++#include <vector>
++
++#include "dxvk_graphics.h"
++#include "dxvk_pipelayout.h"
++#include "dxvk_shader.h"
++
++#include "../vulkan/vulkan_loader.h"
++
++namespace dxvk {
++
++  /**
++   * \brief Resolves a shader descriptor to CPU-readable data
++   *
++   * \param [in] stage Shader stage that declares the descriptor
++   * \param [in] desc Descriptor metadata
++   * \param [out] data Pointer to the first byte of the bound range
++   * \param [out] size Size of the bound range, in bytes
++   * \returns \c true if the resource could be resolved
++   */
++  using DxvkTessEmuResolver = std::function<bool(
++    VkShaderStageFlagBits stage, const DxvkShaderDescriptor& desc,
++    const uint8_t*& data, size_t& size)>;
++
++  /**
++   * \brief Tessellated draw request
++   */
++  struct DxvkTessEmuRequest {
++    Rc<DxvkShader> vs;
++    Rc<DxvkShader> tcs;
++    Rc<DxvkShader> tes;
++
++    DxvkShaderLinkage vsLinkage;
++    DxvkShaderLinkage tcsLinkage;
++    DxvkShaderLinkage tesLinkage;
++
++    uint32_t patchControlPoints = 0u;
++
++    /// Vertex input layout (strides filled in)
++    std::vector<VkVertexInputAttributeDescription> attributes;
++    std::vector<VkVertexInputBindingDescription> bindings;
++
++    /// CPU-readable vertex buffer contents, by binding
++    struct VertexBuffer {
++      const uint8_t* data = nullptr;
++      size_t size = 0u;
++    };
++
++    std::array<VertexBuffer, 32> vertexBuffers = { };
++
++    /// Draw parameters. For indexed draws, \c count is the index count and
++    /// \c first is the first index; otherwise vertex count and first vertex.
++    bool indexed = false;
++    VkIndexType indexType = VK_INDEX_TYPE_UINT32;
++    const uint8_t* indexData = nullptr;
++    size_t indexSize = 0u;
++    uint32_t count = 0u;
++    uint32_t first = 0u;
++    int32_t vertexOffset = 0;
++    uint32_t firstInstance = 0u;
++
++    /// Shared push data word that holds the built-ins
++    uint32_t builtIns = 0u;
++
++    DxvkTessEmuResolver resolver;
++  };
++
++
++  /**
++   * \brief Layout of the captured vertices and the pass-through shader
++   */
++  struct DxvkTessEmuLayout {
++    struct Attribute {
++      uint32_t location;
++      VkFormat format;
++      uint32_t offset;
++    };
++
++    uint32_t stride = 0u;
++    VkPrimitiveTopology topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
++    std::vector<Attribute> attributes;
++    Rc<DxvkShader> passthroughVs;
++  };
++
++
++  /**
++   * \brief Tessellated vertices captured from lavapipe
++   */
++  struct DxvkTessEmuOutput {
++    std::shared_ptr<const DxvkTessEmuLayout> layout;
++    std::vector<uint8_t> vertices;
++    uint32_t vertexCount = 0u;
++  };
++
++
++  /**
++   * \brief Tessellation emulator, backed by a lavapipe device
++   */
++  class DxvkTessEmu {
++
++  public:
++
++    static DxvkTessEmu& get();
++
++    /**
++     * \brief Runs the tessellation stages for one draw
++     *
++     * \param [in] request Draw request
++     * \param [out] output Captured vertices
++     * \param [out] why Failure reason if the call returns \c false
++     * \returns \c true on success
++     */
++    bool run(const DxvkTessEmuRequest& request, DxvkTessEmuOutput& output, std::string& why);
++
++  private:
++
++    struct BindingEntry {
++      VkShaderStageFlagBits stage;
++      DxvkShaderDescriptor  desc;
++      VkDescriptorType      type;
++      uint32_t              binding;
++    };
++
++    struct Pipe {
++      VkShaderModule        vs = VK_NULL_HANDLE;
++      VkShaderModule        tcs = VK_NULL_HANDLE;
++      VkShaderModule        tes = VK_NULL_HANDLE;
++      VkDescriptorSetLayout setLayout = VK_NULL_HANDLE;
++      VkPipelineLayout      layout = VK_NULL_HANDLE;
++      VkPipeline            pipeline = VK_NULL_HANDLE;
++      std::vector<BindingEntry> entries;
++      std::shared_ptr<const DxvkTessEmuLayout> outLayout;
++    };
++
++    DxvkTessEmu();
++
++    bool init();
++
++    Pipe* getPipe(const DxvkTessEmuRequest& rq, std::string& why);
++
++    bool createPipe(Pipe& pipe, const DxvkTessEmuRequest& rq, std::string& why);
++
++    bool ensureBuffer(VkDeviceSize size, std::string& why);
++
++    std::mutex            m_mutex;
++    bool                  m_initialized = false;
++    bool                  m_ok = false;
++    bool                  m_loggedFail = false;
++
++    Rc<vk::LibraryFn>     m_vkl;
++    Rc<vk::InstanceFn>    m_vki;
++    Rc<vk::DeviceFn>      m_vkd;
++
++    VkInstance            m_instance = VK_NULL_HANDLE;
++    VkPhysicalDevice      m_physical = VK_NULL_HANDLE;
++    VkDevice              m_device = VK_NULL_HANDLE;
++    VkQueue               m_queue = VK_NULL_HANDLE;
++    uint32_t              m_queueFamily = 0u;
++    VkPhysicalDeviceMemoryProperties m_memory = { };
++    VkDeviceSize          m_uboAlign = 256u;
++
++    VkCommandPool         m_cmdPool = VK_NULL_HANDLE;
++    VkCommandBuffer       m_cmd = VK_NULL_HANDLE;
++    VkDescriptorPool      m_descPool = VK_NULL_HANDLE;
++
++    VkBuffer              m_buffer = VK_NULL_HANDLE;
++    VkDeviceMemory        m_bufferMem = VK_NULL_HANDLE;
++    VkDeviceSize          m_bufferSize = 0u;
++    uint8_t*              m_bufferMap = nullptr;
++
++    std::unordered_map<std::string, std::unique_ptr<Pipe>> m_pipes;
++
++  };
++
++}
+diff --git a/src/dxvk/meson.build b/src/dxvk/meson.build
+index 40f4cc05..a320ee00 100644
+--- a/src/dxvk/meson.build
++++ b/src/dxvk/meson.build
+@@ -80,6 +80,7 @@ dxvk_src = [
+   'dxvk_staging.cpp',
+   'dxvk_stats.cpp',
+   'dxvk_swapchain_blitter.cpp',
++  'dxvk_tessemu.cpp',
+   'dxvk_unbound.cpp',
+   'dxvk_util.cpp',
+ 

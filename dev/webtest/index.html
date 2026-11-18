@@ -1,0 +1,184 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Edge transparency test</title>
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<style>
+  :root { --bg: #5a5f66; }
+  body { background: var(--bg); color: #fff; font: 14px/1.3 Segoe UI, Arial, sans-serif; margin: 12px; }
+  h1 { font-size: 18px; margin: 0 0 6px; }
+  p.note { margin: 0 0 12px; color: #dde; max-width: 980px; }
+  .grid { display: flex; flex-wrap: wrap; gap: 14px; }
+  .cell { background: var(--bg); outline: 1px dashed #aab; padding: 6px; width: 470px; }
+  .cell.small { width: 240px; }
+  .lab { font-size: 12px; margin-bottom: 4px; color: #ffe9a8; }
+  .good { color: #9f9; } .bad { color: #f99; }
+  img, canvas { display: block; }
+  .checker { background: conic-gradient(#888 25%, #bbb 0 50%, #888 0 75%, #bbb 0) 0 0/20px 20px; padding: 4px; }
+  .box { width: 220px; height: 60px; }
+  .promoted { will-change: transform; }
+  .blurbg { background: linear-gradient(90deg, #e33, #3e3, #33e); height: 70px; position: relative; }
+  .blurbg > div { position: absolute; left: 30px; top: 12px; width: 160px; height: 46px; backdrop-filter: blur(6px); background: rgba(255,255,255,.15); border-radius: 8px; }
+  #status { position: fixed; right: 8px; top: 6px; font-size: 11px; color: #cfe; background: #0008; padding: 2px 6px; }
+</style>
+</head>
+<body>
+<div id="status">live</div>
+<h1>Edge transparency test (page background is the grey you see around the boxes)</h1>
+<p class="note">Every picture below has a fully transparent background. The expected result is that the grey page colour is visible
+behind the lettering. <span class="bad">Black (or white/red) boxes behind a picture mean alpha is lost or blended wrongly.</span>
+The "under" variants store a different RGB beneath the transparent pixels: if the box colour follows that RGB, alpha is being ignored.</p>
+
+<div class="grid">
+  <div class="cell"><div class="lab">S1 EXACT slither.io logo path: offscreen 900x270 canvas -> shadowBlur 16 / shadowOffsetY 7 drawImage -> shown with CSS scale(.5)</div>
+    <div style="width:450px;height:135px"><canvas id="s1" width="900" height="270" style="transform:scale(.5);transform-origin:0 0"></canvas></div></div>
+  <div class="cell"><div class="lab">S2 same as S1 but NO shadow</div>
+    <div style="width:450px;height:135px"><canvas id="s2" width="900" height="270" style="transform:scale(.5);transform-origin:0 0"></canvas></div></div>
+  <div class="cell"><div class="lab">S3 shadow, canvas shown at 1:1 (no CSS transform), 450x135</div><canvas id="s3" width="450" height="135"></canvas></div>
+  <div class="cell"><div class="lab">S4 shadow of a plain rect on a transparent canvas (shadowBlur 16)</div><canvas id="s4" width="450" height="135"></canvas></div>
+  <div class="cell"><div class="lab">S5 S1 with the canvas opacity animated 0..1 (like lmc2.style.opacity = lga)</div>
+    <div style="width:450px;height:135px"><canvas id="s5" width="900" height="270" style="transform:scale(.5);transform-origin:0 0"></canvas></div></div>
+  <div class="cell"><div class="lab">S6 S1 inside a position:fixed-like container with opacity .9 and scale(1.05)</div>
+    <div style="width:450px;height:135px;opacity:.9;transform:scale(1.05);transform-origin:0 0"><canvas id="s6" width="900" height="270" style="transform:scale(.5);transform-origin:0 0"></canvas></div></div>
+  <div class="cell"><div class="lab">A  &lt;img&gt; PNG (like the slither.io logo)</div><img src="logo.png" width="450" height="135"></div>
+  <div class="cell"><div class="lab">B1 &lt;img&gt; PNG, RGB under transparent = BLACK</div><img src="logo_under_black.png" width="450" height="135"></div>
+  <div class="cell"><div class="lab">B2 &lt;img&gt; PNG, RGB under transparent = WHITE</div><img src="logo_under_white.png" width="450" height="135"></div>
+  <div class="cell"><div class="lab">B3 &lt;img&gt; PNG, RGB under transparent = RED</div><img src="logo_under_red.png" width="450" height="135"></div>
+  <div class="cell"><div class="lab">C  CSS background-image PNG</div><div style="width:450px;height:135px;background:url(logo.png) no-repeat"></div></div>
+  <div class="cell"><div class="lab">D1 WebP (lossless, alpha)</div><img src="logo.webp" width="450" height="135"></div>
+  <div class="cell"><div class="lab">D2 GIF (transparent index)</div><img src="logo.gif" width="450" height="135"></div>
+  <div class="cell"><div class="lab">D3 SVG (semi-transparent shapes)</div><img src="shape.svg" width="240" height="90"></div>
+  <div class="cell small"><div class="lab">D4 palette PNG with tRNS</div><img src="palette_trns.png" width="120" height="60"></div>
+  <div class="cell small"><div class="lab">E  alpha ramp 0..255 (red) over checker</div><div class="checker"><img src="ramp.png" width="230" height="40"></div></div>
+  <div class="cell small"><div class="lab">F  CSS rgba(0,0,0,.5) and opacity:.5</div>
+    <div class="blurbg" style="height:70px"><div style="backdrop-filter:none;background:rgba(0,0,0,.5)"></div></div>
+    <div style="margin-top:6px;opacity:.5;background:#fff;color:#000;padding:4px">opacity .5 box</div></div>
+  <div class="cell small"><div class="lab">G  backdrop-filter blur</div><div class="blurbg"><div></div></div></div>
+  <div class="cell"><div class="lab">H  &lt;img&gt; in a promoted layer (will-change: transform)</div><img class="promoted" src="logo.png" width="450" height="135"></div>
+  <div class="cell"><div class="lab">I  &lt;img&gt; with opacity .7 and drop-shadow filter</div><img src="logo.png" width="450" height="135" style="opacity:.7;filter:drop-shadow(0 4px 6px rgba(0,0,0,.6))"></div>
+  <div class="cell"><div class="lab">J1 canvas 2D drawImage(logo.png) onto a transparent canvas</div><canvas id="c2d" width="450" height="135"></canvas></div>
+  <div class="cell"><div class="lab">J2 decoded pixel values (software readback via getImageData)</div><pre id="px" style="margin:0;font-size:12px"></pre></div>
+  <div class="cell small"><div class="lab">K1 WebGL canvas premultipliedAlpha:true, clear rgba(0,0,0,0) + half-transparent quad</div><canvas id="gl1" width="230" height="90"></canvas></div>
+  <div class="cell small"><div class="lab">K2 WebGL canvas premultipliedAlpha:false (same drawing)</div><canvas id="gl2" width="230" height="90"></canvas></div>
+  <div class="cell small"><div class="lab">K3 premult:true, OPAQUE quad (0,1,0,1)</div><canvas id="gl3" width="230" height="90"></canvas></div>
+  <div class="cell small"><div class="lab">K4 premult:true, context alpha:false (no alpha channel), quad (0,0.6,0)</div><canvas id="gl4" width="230" height="90"></canvas></div>
+  <div class="cell small"><div class="lab">K5 premult:true, quad (0.3,0.3,0.3,0.6) (grey, same alpha as K1)</div><canvas id="gl5" width="230" height="90"></canvas></div>
+  <div class="cell small"><div class="lab">K6 premult:false, OPAQUE quad (0,1,0,1)</div><canvas id="gl6" width="230" height="90"></canvas></div>
+  <div class="cell small"><div class="lab">K7 premult:true, clear rgba(1,0,0,.6) only (premult red, no draw)</div><canvas id="gl7" width="230" height="90"></canvas></div>
+  <div class="cell small"><div class="lab">K8 premult:true, quad (0,0.6,0,0.6) + preserveDrawingBuffer</div><canvas id="gl8" width="230" height="90"></canvas></div>
+  <div class="cell small"><div class="lab">K9 WebGL2 premult:true, quad (0,0.6,0,0.6)</div><canvas id="gl9" width="230" height="90"></canvas></div>
+  <div class="cell small"><div class="lab">K10 K1 inside a div with opacity .99</div><div style="opacity:.99"><canvas id="gl10" width="230" height="90"></canvas></div></div>
+
+  <div class="cell small"><div class="lab">G1 backdrop-filter blur(6px) only (no overlay colour), SOLID blue background</div>
+    <div style="background:#2255cc;height:70px;position:relative"><div style="position:absolute;left:30px;top:12px;width:160px;height:46px;backdrop-filter:blur(6px);border-radius:8px"></div></div></div>
+  <div class="cell small"><div class="lab">G2 backdrop-filter brightness(1.6) (colour filter only), gradient</div>
+    <div class="blurbg"><div style="backdrop-filter:brightness(1.6);background:none"></div></div></div>
+  <div class="cell small"><div class="lab">G3 plain filter: blur(3px) on a child element</div>
+    <div class="blurbg" style="overflow:hidden"><div style="backdrop-filter:none;background:#fff;filter:blur(3px);left:40px;width:110px"></div></div></div>
+  <div class="cell small"><div class="lab">G4 backdrop-filter blur(6px), square corners, over gradient</div>
+    <div class="blurbg"><div style="border-radius:0"></div></div></div>
+  <div class="cell small"><div class="lab">G5 backdrop-filter blur(20px), big radius, over gradient</div>
+    <div class="blurbg"><div style="backdrop-filter:blur(20px);border-radius:23px"></div></div></div>
+  <div class="cell small"><div class="lab">G6 same as G over a SOLID grey page area (no gradient)</div>
+    <div style="background:#777;height:70px;position:relative"><div style="position:absolute;left:30px;top:12px;width:160px;height:46px;backdrop-filter:blur(6px);background:rgba(255,255,255,.15);border-radius:8px"></div></div></div>
+</div>
+
+<script>
+// J1 + J2: decode in software and draw to canvas
+const im = new Image();
+im.onload = () => {
+  const c = document.getElementById('c2d'), x = c.getContext('2d');
+  x.drawImage(im, 0, 0, 450, 135);
+  x.fillStyle = 'rgba(255,255,0,0.5)'; x.fillRect(380, 100, 60, 30);
+  const t = document.createElement('canvas'); t.width = 450; t.height = 135;
+  const tx = t.getContext('2d', { willReadFrequently: true }); tx.drawImage(im, 0, 0);
+  const p = (px, py) => Array.from(tx.getImageData(px, py, 1, 1).data).join(',');
+  document.getElementById('px').textContent =
+    'size ' + im.naturalWidth + 'x' + im.naturalHeight + '\n' +
+    'pixel (2,2)    r,g,b,a = ' + p(2, 2) + '   (alpha should be 0)\n' +
+    'pixel (68,27)  r,g,b,a = ' + p(68, 27) + '   (inside the "s": 69,208,131,255)\n' +
+    'pixel (129,32) r,g,b,a = ' + p(129, 32) + '   (glow edge: 58,133,107,72)\n' +
+    'UA: ' + navigator.userAgent.replace(/.*(Edg\/[\d.]+).*/, '$1');
+};
+im.src = 'logo.png';
+// S1..S6: the slither.io logo path. The game draws gradient filled circles into an offscreen canvas (lmc) and copies it into the
+// visible one (lmc2) with a black shadow; here the source canvas gets logo.png (same alpha content) instead of the circles.
+function slither(id, opts) {
+  const src = document.createElement('canvas'); src.width = 900; src.height = 270;
+  const c = document.getElementById(id), x = c.getContext('2d'), sx = src.getContext('2d');
+  const draw = () => {
+    sx.clearRect(0, 0, 900, 270);
+    sx.drawImage(logoimg, 20, 30, 450 * 1.8, 135 * 1.8);       // the logo as the offscreen content
+    x.clearRect(0, 0, c.width, c.height);
+    if (opts.shadow) { x.shadowColor = '#000000'; x.shadowBlur = 16; x.shadowOffsetY = 7; }
+    x.drawImage(src, 0, 0, c.width, c.height);
+  };
+  draw();
+  if (opts.anim) { let a = 0; setInterval(() => { a += 0.02; if (a > 1) a = 0; c.style.opacity = a; }, 25); }
+}
+const logoimg = new Image();
+logoimg.onload = () => {
+  slither('s1', { shadow: true }); slither('s2', { shadow: false }); slither('s3', { shadow: true });
+  slither('s5', { shadow: true, anim: true }); slither('s6', { shadow: true });
+  const x = document.getElementById('s4').getContext('2d');
+  x.shadowColor = '#000000'; x.shadowBlur = 16; x.shadowOffsetY = 7; x.fillStyle = '#3fdc7a'; x.fillRect(40, 20, 200, 60);
+};
+logoimg.src = 'logo.png';
+// K1/K2: WebGL, draw a half transparent quad on a transparent-cleared canvas
+function gl(id, premult) {
+  const c = document.getElementById(id);
+  const g = c.getContext('webgl', { alpha: true, premultipliedAlpha: premult });
+  if (!g) { c.outerHTML = '<span class="bad">no WebGL</span>'; return; }
+  g.clearColor(0, 0, 0, 0); g.clear(g.COLOR_BUFFER_BIT);
+  const vs = g.createShader(g.VERTEX_SHADER); g.shaderSource(vs, 'attribute vec2 p;void main(){gl_Position=vec4(p,0.,1.);}'); g.compileShader(vs);
+  const fs = g.createShader(g.FRAGMENT_SHADER);
+  g.shaderSource(fs, premult ? 'precision mediump float;void main(){gl_FragColor=vec4(0.0,0.6,0.0,0.6);}'
+                             : 'precision mediump float;void main(){gl_FragColor=vec4(0.0,1.0,0.0,0.6);}');
+  g.compileShader(fs);
+  const pr = g.createProgram(); g.attachShader(pr, vs); g.attachShader(pr, fs); g.linkProgram(pr); g.useProgram(pr);
+  const b = g.createBuffer(); g.bindBuffer(g.ARRAY_BUFFER, b);
+  g.bufferData(g.ARRAY_BUFFER, new Float32Array([-0.6,-0.6, 0.6,-0.6, -0.6,0.6, 0.6,0.6]), g.STATIC_DRAW);
+  const l = g.getAttribLocation(pr, 'p'); g.enableVertexAttribArray(l); g.vertexAttribPointer(l, 2, g.FLOAT, false, 0, 0);
+  g.drawArrays(g.TRIANGLE_STRIP, 0, 4);
+}
+// throwaway first WebGL context: is K1 invisible only because it is the first context of the page?
+try { document.createElement('canvas').getContext('webgl'); } catch (e) {}
+gl('gl1', true); gl('gl2', false);
+// K3..K10: variants of the WebGL alpha test.  glx(id, {premult, alpha, color:[r,g,b,a], clear:[r,g,b,a]|null, preserve, v2, draw})
+function glx(id, o) {
+  const c = document.getElementById(id);
+  const g = c.getContext(o.v2 ? 'webgl2' : 'webgl', { alpha: o.alpha !== false, premultipliedAlpha: o.premult, preserveDrawingBuffer: !!o.preserve });
+  if (!g) { c.outerHTML = '<span class="bad">no ' + (o.v2 ? 'WebGL2' : 'WebGL') + '</span>'; return; }
+  const cl = o.clear || [0, 0, 0, 0]; g.clearColor(cl[0], cl[1], cl[2], cl[3]); g.clear(g.COLOR_BUFFER_BIT);
+  if (o.draw === false) return;
+  const vs = g.createShader(g.VERTEX_SHADER); g.shaderSource(vs, 'attribute vec2 p;void main(){gl_Position=vec4(p,0.,1.);}'); g.compileShader(vs);
+  const fs = g.createShader(g.FRAGMENT_SHADER);
+  g.shaderSource(fs, 'precision mediump float;void main(){gl_FragColor=vec4(' + o.color.map(v => v.toFixed(2)).join(',') + ');}'); g.compileShader(fs);
+  const pr = g.createProgram(); g.attachShader(pr, vs); g.attachShader(pr, fs); g.linkProgram(pr); g.useProgram(pr);
+  const b = g.createBuffer(); g.bindBuffer(g.ARRAY_BUFFER, b);
+  g.bufferData(g.ARRAY_BUFFER, new Float32Array([-0.6,-0.6, 0.6,-0.6, -0.6,0.6, 0.6,0.6]), g.STATIC_DRAW);
+  const l = g.getAttribLocation(pr, 'p'); g.enableVertexAttribArray(l); g.vertexAttribPointer(l, 2, g.FLOAT, false, 0, 0);
+  g.drawArrays(g.TRIANGLE_STRIP, 0, 4);
+}
+glx('gl3', { premult: true, color: [0, 1, 0, 1] });
+glx('gl4', { premult: true, alpha: false, color: [0, 0.6, 0, 1], clear: [0, 0, 0, 1] });
+glx('gl5', { premult: true, color: [0.3, 0.3, 0.3, 0.6] });
+glx('gl6', { premult: false, color: [0, 1, 0, 1] });
+glx('gl7', { premult: true, draw: false, clear: [0.6, 0, 0, 0.6] });
+glx('gl8', { premult: true, color: [0, 0.6, 0, 0.6], preserve: true });
+glx('gl9', { premult: true, color: [0, 0.6, 0, 0.6], v2: true });
+glx('gl10', { premult: true, color: [0, 0.6, 0, 0.6] });
+// live reload: poll this page and reload when it changes
+let last = null;
+setInterval(async () => {
+  try {
+    const r = await fetch(location.pathname + '?_=' + Date.now(), { cache: 'no-store' });
+    const t = await r.text();
+    if (last !== null && t !== last) location.reload();
+    last = t; document.getElementById('status').textContent = 'live ' + new Date().toLocaleTimeString();
+  } catch (e) { document.getElementById('status').textContent = 'server unreachable'; }
+}, 1500);
+</script>
+</body>
+</html>

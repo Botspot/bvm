@@ -1,0 +1,46 @@
+diff --git a/spirv/spirv_builder.cpp b/spirv/spirv_builder.cpp
+index 8816c1f..b4ffcfe 100644
+--- a/spirv/spirv_builder.cpp
++++ b/spirv/spirv_builder.cpp
+@@ -934,9 +934,11 @@ void SpirvBuilder::emitDclBuiltInIoVar(const ir::Op& op) {
+           ? spv::BuiltInFragCoord : spv::BuiltInPosition;
+ 
+       case ir::BuiltIn::eVertexId: {
+-        m_drawParams.baseVertex = emitBuiltInDrawParameter(spv::BuiltInBaseVertex);
++        if (!m_options.noBaseVertex) {
++          m_drawParams.baseVertex = emitBuiltInDrawParameter(spv::BuiltInBaseVertex);
+ 
+-        enableCapability(spv::CapabilityDrawParameters);
++          enableCapability(spv::CapabilityDrawParameters);
++        }
+         return spv::BuiltInVertexIndex;
+       }
+ 
+@@ -3369,6 +3371,13 @@ void SpirvBuilder::emitLoadDrawParameterBuiltIn(const ir::Op& op, ir::BuiltIn bu
+   auto baseId = allocId();
+ 
+   pushOp(m_code, spv::OpLoad, intTypeId, indexId, getIdForDef(ir::SsaDef(op.getOperand(0u))));
++
++  /* No BaseVertex available: use the vertex index as-is */
++  if (builtIn == ir::BuiltIn::eVertexId && m_options.noBaseVertex) {
++    pushOp(m_code, spv::OpBitcast, getIdForType(op.getType()), getIdForDef(op.getDef()), indexId);
++    return;
++  }
++
+   pushOp(m_code, spv::OpLoad, intTypeId, baseId, builtIn == ir::BuiltIn::eVertexId
+     ? m_drawParams.baseVertex : m_drawParams.baseInstance);
+ 
+diff --git a/spirv/spirv_builder.h b/spirv/spirv_builder.h
+index 21bae34..73d842c 100644
+--- a/spirv/spirv_builder.h
++++ b/spirv/spirv_builder.h
+@@ -31,6 +31,9 @@ public:
+     /** Whether dual-source blending is enabled. This affects
+      *  output location mapping in fragment shaders only. */
+     bool dualSourceBlending = false;
++    /** Do not use the BaseVertex built-in (device lacks shaderDrawParameters).
++     *  The vertex ID then includes the draw's base vertex. */
++    bool noBaseVertex = false;
+     /** Whether FloatControls2 is fully supported */
+     bool floatControls2 = false;
+     /** Supported rounding modes for the given float types */

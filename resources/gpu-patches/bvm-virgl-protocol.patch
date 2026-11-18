@@ -1,0 +1,50 @@
+--- a/npt_protocol_host_id3d11device.h
++++ b/npt_protocol_host_id3d11device.h
+@@ -10,6 +10,8 @@
+ #ifndef NPT_PROTOCOL_HOST_ID3D11DEVICE_H
+ #define NPT_PROTOCOL_HOST_ID3D11DEVICE_H
+ 
++#include <stdio.h>  /* BVM-GPU-TRACE: snprintf/getenv for NPT_TRACE reply logging below */
++#include <stdlib.h>
+ #include "npt_protocol_host_structs.h"
+ #include "npt_protocol_host_dispatch_types.h"
+ 
+@@ -4327,6 +4329,10 @@
+     } else {
+         args.ret = _original(args._self, args.Format, args.pFormatSupport);
+     }
++    /* BVM-GPU-TRACE */
++    if (getenv("NPT_TRACE"))
++        npt_log("REPLY CheckFormatSupport fmt=%u support=0x%x ret=0x%x", (unsigned)args.Format,
++                args.pFormatSupport ? (unsigned)*args.pFormatSupport : 0u, (unsigned)args.ret);
+ 
+     /* Register any output COM handles in the context object table so
+      * later commands that reference them can be validated.  A void**
+@@ -4456,6 +4462,11 @@
+     } else {
+         args.ret = _original(args._self, args.Format, args.SampleCount, args.pNumQualityLevels);
+     }
++    /* BVM-GPU-TRACE */
++    if (getenv("NPT_TRACE"))
++        npt_log("REPLY CheckMultisampleQualityLevels fmt=%u samples=%u levels=%u ret=0x%x", (unsigned)args.Format,
++                (unsigned)args.SampleCount, args.pNumQualityLevels ? (unsigned)*args.pNumQualityLevels : 0u,
++                (unsigned)args.ret);
+ 
+     /* Register any output COM handles in the context object table so
+      * later commands that reference them can be validated.  A void**
+@@ -4943,6 +4954,15 @@
+     } else {
+         args.ret = _original(args._self, args.Feature, args.pFeatureSupportData, args.FeatureSupportDataSize);
+     }
++    /* BVM-GPU-TRACE: feature id, size, first 16 bytes of the reply, result */
++    if (getenv("NPT_TRACE")) {
++        const unsigned char *d = (const unsigned char *)args.pFeatureSupportData;
++        char hex[16 * 3 + 1] = { 0 };
++        for (unsigned i = 0; d && i < 16 && i < args.FeatureSupportDataSize; i++)
++            snprintf(hex + i * 3, 4, "%02x ", d[i]);
++        npt_log("REPLY CheckFeatureSupport feature=%u size=%u ret=0x%x data=%s", (unsigned)args.Feature,
++                (unsigned)args.FeatureSupportDataSize, (unsigned)args.ret, hex);
++    }
+ 
+     /* Register any output COM handles in the context object table so
+      * later commands that reference them can be validated.  A void**

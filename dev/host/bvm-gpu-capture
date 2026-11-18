@@ -1,0 +1,35 @@
+#!/bin/bash
+# Run the VM with GFXReconstruct capturing the Vulkan calls of every Neptune render-server context
+# (DEV-NOTES.md item 116). It sets the BVM_GFXR_* variables that the patched virglrenderer reads and then starts GPU mode (bvm boot-gpu):
+#   [VAR=...] ~/bvm/dev/host/bvm-gpu-capture ~/win11 > ~/bvm/scratchpad/run-cap1.log 2>&1
+# Needs GPU mode built (bvm gpu-setup) and a gfxreconstruct layer (dev/host/build-gfxr.sh).
+# Capture files: $BVM_GFXR_DIR (default ~/bvm/scratchpad/captures/<stamp>)/ctx<id>_pid<pid>.gfxr, one per render-server
+# context (DWM, Edge, ...).  A layer can only record from the start of a process, so the DWM context is recorded from
+# the moment it starts (login), but Edge etc. only when they start: you do not need to start Edge to get the hang
+# (hovering the start button / search box after login was enough).
+# Settings (env, optional): BVM_GFXR_COMPRESSION=LZ4|ZSTD|ZLIB|NONE (default ZSTD), BVM_GFXR_MEM=page_guard|assisted|unassisted
+# (default page_guard: DXVK's memory is HOST_COHERENT and never flushed, so only page_guard sees its writes),
+# BVM_GFXR_FLUSH=true|false (flush every block; default true so a killed process still leaves a replayable file).
+# page_guard + flushing slow the render server down, which can change the timing of the hang.
+DIR=${BVM_GFXR_DIR:-$HOME/bvm/scratchpad/captures/$(date +%Y%m%d-%H%M%S)}
+mkdir -p "$DIR" || exit 1
+avail_gb=$(df -BG --output=avail "$DIR" | tail -1 | tr -dc 0-9)
+if [ "${avail_gb:-0}" -lt 15 ]; then
+  echo "only ${avail_gb} GB free on $(df --output=target "$DIR" | tail -1); free space or set BVM_GFXR_DIR elsewhere" >&2
+  exit 1
+fi
+export BVM_GFXR_DIR=$DIR
+# prefer the self-built current layer (tools/build-gfxr.sh); the Debian 0.9.18 layer crashed the render-server workers
+PREFIX=$HOME/gfxr/gfxr-install
+# (tools/gfxr-layer holds a copy of the JSON with an absolute library_path: the installed JSON names the .so
+# without a directory, so the loader picked up the Debian 0.9.18 library from the system path instead)
+LAYER_JSON=$HOME/gfxr/gfxr-layer/VkLayer_gfxreconstruct.json
+[ -f "$LAYER_JSON" ] || LAYER_JSON=
+if [ -n "$LAYER_JSON" ]; then
+  export BVM_GFXR_LAYER_PATH=$(dirname "$LAYER_JSON")
+  echo "using layer from $BVM_GFXR_LAYER_PATH" >&2
+else
+  echo "WARNING: no self-built layer in $PREFIX (run ~/gfxr/build-gfxr.sh); the Debian 0.9.18 layer crashes the render server" >&2
+fi
+echo "GFXReconstruct captures -> $DIR  (${avail_gb} GB free; watch it with: watch -n5 du -sh $DIR)" >&2
+exec "$HOME/bvm/bvm" boot-gpu "$@"

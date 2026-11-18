@@ -1,0 +1,63 @@
+diff --git a/src/neptune/npt_ring.c b/src/neptune/npt_ring.c
+index 41eaf3f..6af6310 100644
+--- a/src/neptune/npt_ring.c
++++ b/src/neptune/npt_ring.c
+@@ -327,6 +327,50 @@ npt_ring_relax(uint32_t *iter)
+ #endif
+ }
+ 
++/* BVM-GPU-DIAG: dump the bytes around a decode failure. */
++static void
++npt_ring_dump_failure(const uint8_t *buffer, size_t size, const uint8_t *cur,
++                      uint32_t ring_head)
++{
++   const size_t off = (size_t)(cur - buffer);
++   npt_log("DIAG: batch size=%zu ring_head=%u fail_offset=%zu remaining=%zu",
++           size, ring_head, off, size - off);
++   /* Walk the commands by their cmd_size (24-byte header: type, flags, object_id, cmd_size, reserved)
++    * and print the last few, marking the one that contains the failure. */
++   {
++      size_t pos = 0;
++      size_t starts[512];
++      size_t n = 0;
++      while (pos + 24 <= size && n < 512) {
++         uint32_t csize;
++         memcpy(&csize, buffer + pos + 16, 4);
++         starts[n++] = pos;
++         if (csize < 24 || pos + csize > size)
++            break;
++         pos += csize;
++      }
++      for (size_t k = n > 10 ? n - 10 : 0; k < n; k++) {
++         uint32_t type, flags, csize;
++         uint64_t obj;
++         memcpy(&type, buffer + starts[k], 4);
++         memcpy(&flags, buffer + starts[k] + 4, 4);
++         memcpy(&obj, buffer + starts[k] + 8, 8);
++         memcpy(&csize, buffer + starts[k] + 16, 4);
++         npt_log("DIAG: cmd@%zu type=0x%08x (grp=%u if=%u meth=%u) flags=%u obj=%" PRIu64 " size=%u%s",
++                 starts[k], type, type >> 24, (type >> 8) & 0xffff, type & 0xff, flags, obj, csize,
++                 (starts[k] <= off && off < starts[k] + csize) ? "  <-- failed inside" : "");
++      }
++   }
++   const size_t from = off > 64 ? (off - 64) & ~(size_t)15 : 0;
++   const size_t to = size < off + 64 ? size : off + 64;
++   for (size_t i = from; i < to; i += 16) {
++      char line[16 * 3 + 1] = { 0 };
++      for (size_t j = 0; j < 16 && i + j < size; j++)
++         snprintf(line + j * 3, 4, "%02x ", buffer[i + j]);
++      npt_log("DIAG: %5zu%s %s", i, (i <= off && off < i + 16) ? " <--" : "    ", line);
++   }
++}
++
+ static bool
+ npt_ring_submit_cmd(struct npt_ring *ring,
+                     const uint8_t *buffer,
+@@ -357,6 +401,7 @@ npt_ring_submit_cmd(struct npt_ring *ring,
+       if (!npt_context_dispatch_one_command(ring->context, &ring->dispatch,
+                                             dec, &ring->encoder)) {
+          npt_log("ring_submit_cmd: dispatch failed");
++         npt_ring_dump_failure(buffer, size, dec->cur, ring_head); /* BVM-GPU-DIAG */
+          npt_cs_decoder_reset(dec);
+          return false;
+       }

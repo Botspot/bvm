@@ -1,0 +1,897 @@
+diff --git a/audio/audio.c b/audio/audio.c
+index 057cf2c..8f50c92 100644
+--- a/audio/audio.c
++++ b/audio/audio.c
+@@ -27,6 +27,12 @@
+ #include "migration/vmstate.h"
+ #include "monitor/monitor.h"
+ #include "qemu/timer.h"
++#include "qemu/main-loop.h"
++#include "block/aio.h"
++#include "system/iothread.h"
++#ifdef CONFIG_LINUX
++#include <sys/resource.h>
++#endif
+ #include "qapi/error.h"
+ #include "qapi/clone-visitor.h"
+ #include "qapi/qobject-input-visitor.h"
+@@ -856,6 +862,68 @@ static void audio_timer (void *opaque)
+     audio_reset_timer(s);
+ }
+ 
++/*
++ * BVMGPU: the audio pump (audio_timer: device callback -> backend ring buffer) normally runs on the
++ * main loop, so a busy or starved main thread (display blits, swapping, guest CPU load) makes it late,
++ * the backend runs dry and the speakers crackle. Run the timer in its own IOThread instead, which can
++ * be given a low nice value like PipeWire's own threads. The device callbacks still need the BQL, so
++ * the thread takes it around the pump: the gain is that the wake-up is no longer queued behind the main
++ * loop's other work.
++ *
++ * The pump thread and the PipeWire backend's thread get nice -11. A plain user may only lower nice if
++ * in the 'pipewire' group (limits.d: nice -19); otherwise a warning is printed and nothing changes.
++ */
++void bvm_audio_set_thread_priority(const char *what, pid_t tid)
++{
++#ifdef CONFIG_LINUX
++    const int nice_val = -11;
++
++    if (setpriority(PRIO_PROCESS, tid, nice_val) == 0) {
++        info_report("audio: %s thread nice set to %d", what, nice_val);
++    } else {
++        warn_report("audio: cannot set nice %d on the %s thread: %s (add the user to the 'pipewire' "
++                    "group to allow it)", nice_val, what, strerror(errno));
++    }
++#endif
++}
++
++static IOThread *audio_pump_iothread;
++
++static void audio_timer_iothread(void *opaque)
++{
++    /*
++     * Do not block in bql_lock(): when the VM is being stopped (shutdown, Ctrl+C, window close) the main
++     * thread holds the BQL in pause_all_vcpus() -> qemu_clock_enable(QEMU_CLOCK_VIRTUAL, false), which waits
++     * for this callback to return. Poll the lock and give up once the VM is no longer running (the timer is
++     * re-armed by audio_vm_change_state_handler() on resume).
++     */
++    for (int spins = 0; !bvm_bql_trylock(); spins++) {
++        if (!runstate_is_running()) {
++            return;
++        }
++        if (spins >= 50) {
++            g_usleep(100);
++        }
++    }
++    audio_timer(opaque);
++    bql_unlock();
++}
++
++static AioContext *audio_pump_context(void)
++{
++    Error *err = NULL;
++
++    if (!audio_pump_iothread) {
++        audio_pump_iothread = iothread_create("bvm-audio", &err);
++        if (!audio_pump_iothread) {
++            warn_report_err(err);
++            return NULL;
++        }
++        bvm_audio_set_thread_priority("pump", audio_pump_iothread->thread_id);
++    }
++    return iothread_get_aio_context(audio_pump_iothread);
++}
++
+ /*
+  * Public API
+  */
+@@ -1687,6 +1755,28 @@ static void free_audio_state(AudioState *s)
+ 
+ void audio_cleanup(void)
+ {
++    /*
++     * BVMGPU: stop the pump thread before any AudioState is freed. The join is done with the BQL
++     * released because a pump callback may be waiting for it; once the thread is gone no callback
++     * can run against freed state. iothread_stop() is idempotent (the object is finalized later).
++     */
++    if (audio_pump_iothread) {
++        bool had_bql = bql_locked();
++
++        if (had_bql) {
++            bql_unlock();
++        }
++        iothread_stop(audio_pump_iothread);
++        if (had_bql) {
++            bql_lock();
++        }
++        /*
++         * audio_cleanup() runs twice (qemu_cleanup() and atexit) and the IOThread object is freed in
++         * between by user_creatable_cleanup(): forget it, or the second call joins a dangling thread.
++         */
++        audio_pump_iothread = NULL;
++    }
++
+     default_audio_state = NULL;
+     while (!QTAILQ_EMPTY(&audio_states)) {
+         AudioState *s = QTAILQ_FIRST(&audio_states);
+@@ -1760,7 +1850,16 @@ static AudioState *audio_init(Audiodev *dev, Error **errp)
+         atexit_registered = true;
+     }
+ 
+-    s->ts = timer_new_ns(QEMU_CLOCK_VIRTUAL, audio_timer, s);
++    {
++        AioContext *pump_ctx = audio_pump_context();
++
++        if (pump_ctx) {
++            s->ts = aio_timer_new(pump_ctx, QEMU_CLOCK_VIRTUAL, SCALE_NS,
++                                  audio_timer_iothread, s);
++        } else {
++            s->ts = timer_new_ns(QEMU_CLOCK_VIRTUAL, audio_timer, s);
++        }
++    }
+ 
+     if (dev) {
+         /* -audiodev option */
+diff --git a/audio/audio_int.h b/audio/audio_int.h
+index 9ba4a14..d3eb889 100644
+--- a/audio/audio_int.h
++++ b/audio/audio_int.h
+@@ -252,6 +252,9 @@ int audio_bug (const char *funcname, int cond);
+ 
+ void audio_run(AudioState *s, const char *msg);
+ 
++/* BVMGPU: raise the priority of an audio thread (tid 0 = calling thread). See audio.c. */
++void bvm_audio_set_thread_priority(const char *what, pid_t tid);
++
+ const char *audio_application_name(void);
+ 
+ typedef struct RateCtl {
+diff --git a/audio/pwaudio.c b/audio/pwaudio.c
+index 8e13b58..a007631 100644
+--- a/audio/pwaudio.c
++++ b/audio/pwaudio.c
+@@ -49,6 +49,9 @@ typedef struct PWVoice {
+     struct spa_audio_info_raw info;
+     uint32_t highwater_mark;
+     uint32_t frame_size, req;
++    /* BVMGPU: jitter buffer for playback, see playback_on_process() */
++    uint32_t prefill_bytes;
++    bool primed;
+     struct spa_ringbuffer ring;
+     uint8_t buffer[RINGBUFFER_SIZE];
+ 
+@@ -112,6 +115,22 @@ playback_on_process(void *data)
+     /* get no of available bytes to read data from buffer */
+     avail = spa_ringbuffer_get_read_index(&v->ring, &index);
+ 
++    /*
++     * BVMGPU: jitter buffer. The pump delivers in 10 ms bursts while PipeWire pulls every few ms, so
++     * without a cushion any late burst plays silence (and the next callbacks then alternate between
++     * a little data and silence = crackle). Do not start playing until the ring holds prefill_bytes,
++     * and after a real underrun (ring empty) wait for it to fill up again. Costs prefill ms of latency.
++     */
++    if (!v->primed && avail >= (int32_t) v->prefill_bytes) {
++        v->primed = true;
++    }
++    if (v->primed && v->prefill_bytes && avail <= 0) {
++        v->primed = false;
++    }
++    if (!v->primed) {
++        avail = 0;
++    }
++
+     if (avail <= 0) {
+         PWVoiceOut *vo = container_of(data, PWVoiceOut, v);
+         audio_pcm_info_clear_buf(&vo->hw.info, p, n_bytes / v->frame_size);
+@@ -558,6 +577,16 @@ qpw_init_out(HWVoiceOut *hw, struct audsettings *as, void *drv_opaque)
+                             (ppdo->has_latency ? ppdo->latency : 46440)
+                             * (uint64_t)v->info.rate / 1000000 * v->frame_size);
+ 
++    /* BVMGPU: prefill target for the jitter buffer: 60 ms, never more than half of what the ring may
++     * hold (out.latency) or the stream would never start. */
++    v->prefill_bytes = MIN((uint64_t)60 * v->info.rate / 1000 * v->frame_size, v->highwater_mark / 2);
++    v->primed = (v->prefill_bytes == 0);
++    if (v->prefill_bytes) {
++        info_report("audio: PipeWire playback prefill %u bytes (%.0f ms), ring cap %.0f ms",
++                    v->prefill_bytes, v->prefill_bytes * 1000.0 / (v->info.rate * v->frame_size),
++                    v->highwater_mark * 1000.0 / (v->info.rate * v->frame_size));
++    }
++
+     pw_thread_loop_unlock(c->thread_loop);
+     return 0;
+ }
+@@ -735,6 +764,33 @@ static const struct pw_core_events core_events = {
+     .error = on_core_error,
+ };
+ 
++/*
++ * BVMGPU: raise the priority of the threads PipeWire created for us. pw_loop_invoke() into the thread
++ * loop trips its lock accounting ("this->recurse > 0 failed in do_unlock"), so find the threads by
++ * name instead: "PipeWire thread loop" (comm is cut to 15 chars) and PipeWire's data loop thread.
++ */
++static void bvm_pw_raise_thread_priorities(void)
++{
++#ifdef CONFIG_LINUX
++    GDir *dir = g_dir_open("/proc/self/task", 0, NULL);
++    const char *name;
++
++    while (dir && (name = g_dir_read_name(dir))) {
++        g_autofree char *path = g_strdup_printf("/proc/self/task/%s/comm", name);
++        g_autofree char *comm = NULL;
++
++        if (g_file_get_contents(path, &comm, NULL, NULL) &&
++            (g_str_has_prefix(comm, "PipeWire thread") ||
++             g_str_has_prefix(comm, "data-loop"))) {
++            bvm_audio_set_thread_priority("PipeWire", atoi(name));
++        }
++    }
++    if (dir) {
++        g_dir_close(dir);
++    }
++#endif
++}
++
+ static void *
+ qpw_audio_init(Audiodev *dev, Error **errp)
+ {
+@@ -764,6 +820,9 @@ qpw_audio_init(Audiodev *dev, Error **errp)
+         goto fail;
+     }
+ 
++    /* BVMGPU: raise the priority of the thread that feeds PipeWire (see audio.c) */
++    bvm_pw_raise_thread_priorities();
++
+     pw_thread_loop_lock(pw->thread_loop);
+ 
+     pw->core = pw_context_connect(pw->context, NULL, 0);
+diff --git a/hw/display/virtio-gpu-base.c b/hw/display/virtio-gpu-base.c
+index 7827536..1e89c1e 100644
+--- a/hw/display/virtio-gpu-base.c
++++ b/hw/display/virtio-gpu-base.c
+@@ -64,6 +64,18 @@ virtio_gpu_base_generate_edid(VirtIOGPUBase *g, int scanout,
+         .refresh_rate = g->req_state[scanout].refresh_rate,
+     };
+ 
++    /*
++     * BVMGPU: headless displays (egl-headless) never report a refresh rate, so
++     * the EDID would say 75 Hz. BVM_GUEST_HZ sets it, as for the SDL display.
++     */
++    if (!info.refresh_rate) {
++        const char *hz = getenv("BVM_GUEST_HZ");
++
++        if (hz && atoi(hz) > 0) {
++            info.refresh_rate = atoi(hz) * 1000;
++        }
++    }
++
+     edid->size = cpu_to_le32(sizeof(edid->edid));
+     qemu_edid_generate(edid->edid, sizeof(edid->edid), &info);
+ }
+diff --git a/hw/display/virtio-gpu-udmabuf.c b/hw/display/virtio-gpu-udmabuf.c
+index b4724da..a552c09 100644
+--- a/hw/display/virtio-gpu-udmabuf.c
++++ b/hw/display/virtio-gpu-udmabuf.c
+@@ -186,7 +186,7 @@ static VGPUDMABuf
+     dmabuf->buf = qemu_dmabuf_new(r->width, r->height, fb->stride,
+                                   r->x, r->y, fb->width, fb->height,
+                                   qemu_pixman_to_drm_format(fb->format),
+-                                  0, res->dmabuf_fd, true, false);
++                                  res->dmabuf_modifier, res->dmabuf_fd, true, false);
+     dmabuf->scanout_id = scanout_id;
+     /* Remember the request identity so a later identical present can reuse
+      * this dmabuf + its EGL import instead of re-creating it. */
+diff --git a/hw/display/virtio-gpu-virgl.c b/hw/display/virtio-gpu-virgl.c
+index a57f9e0..a16edf9 100644
+--- a/hw/display/virtio-gpu-virgl.c
++++ b/hw/display/virtio-gpu-virgl.c
+@@ -1015,6 +1015,18 @@ static void virgl_cmd_resource_create_blob(VirtIOGPU *g,
+ 
+     res->base.dmabuf_fd = info.fd;
+ 
++#if VIRGL_VERSION_MAJOR >= 1
++    {
++        /* The exporter may have picked a tiled layout (e.g. Broadcom UIF
++         * for Neptune); the display import needs the modifier. */
++        struct virgl_renderer_resource_info_ext info_ext;
++        memset(&info_ext, 0, sizeof(info_ext));
++        if (!virgl_renderer_resource_get_info_ext(cblob.resource_id, &info_ext)) {
++            res->base.dmabuf_modifier = info_ext.modifiers;
++        }
++    }
++#endif
++
+     /* Now live, cleaned up in virtio_gpu_virgl_resource_unref */
+     QTAILQ_INSERT_HEAD(&g->reslist, &res->base, next);
+     g_steal_pointer(&res);
+diff --git a/hw/usb/hcd-xhci.c b/hw/usb/hcd-xhci.c
+index 969f275..d870eeb 100644
+--- a/hw/usb/hcd-xhci.c
++++ b/hw/usb/hcd-xhci.c
+@@ -1764,7 +1764,13 @@ static void xhci_calc_iso_kick(XHCIState *xhci, XHCITransfer *xfer,
+         xfer->mfindex_kick = ((xfer->trbs[0].control >> TRB_TR_FRAMEID_SHIFT)
+                               & TRB_TR_FRAMEID_MASK) << 3;
+         xfer->mfindex_kick |= mfindex & ~0x3fff;
+-        if (xfer->mfindex_kick + 0x100 < mfindex) {
++        /*
++         * BVMGPU: a TD whose frame is already past by more than the tolerance was taken to be meant
++         * for the next 2048 ms wrap, so a main-thread stall of > 32 ms (0x100 microframes) delayed
++         * the audio packet by 2.048 s (the "gap_max=2047 ms" windows). Guests schedule at most ~895 ms
++         * ahead, so lateness up to 256 ms (0x800) cannot be confused with the future: run late TDs now.
++         */
++        if (xfer->mfindex_kick + 0x800 < mfindex) {
+             xfer->mfindex_kick += 0x4000;
+         }
+     }
+diff --git a/include/hw/virtio/virtio-gpu.h b/include/hw/virtio/virtio-gpu.h
+index de53f96..5499e66 100644
+--- a/include/hw/virtio/virtio-gpu.h
++++ b/include/hw/virtio/virtio-gpu.h
+@@ -58,6 +58,7 @@ struct virtio_gpu_simple_resource {
+     uint64_t blob_size;
+     void *blob;
+     int dmabuf_fd;
++    uint64_t dmabuf_modifier; /* DRM format modifier of dmabuf_fd, 0 = linear */
+     uint8_t *remapped;
+ 
+     QTAILQ_ENTRY(virtio_gpu_simple_resource) next;
+diff --git a/include/qemu/main-loop.h b/include/qemu/main-loop.h
+index 4e2436b..48a1920 100644
+--- a/include/qemu/main-loop.h
++++ b/include/qemu/main-loop.h
+@@ -350,6 +350,9 @@ bool qemu_in_main_thread(void);
+ #define bql_lock() bql_lock_impl(__FILE__, __LINE__)
+ void bql_lock_impl(const char *file, int line);
+ 
++/* BVMGPU: take the BQL only if it is free; true when taken (see system/cpus.c) */
++bool bvm_bql_trylock(void);
++
+ /**
+  * bql_unlock: Unlock the Big QEMU Lock (BQL).
+  *
+diff --git a/include/ui/sdl2.h b/include/ui/sdl2.h
+index 42edd1f..60e659a 100644
+--- a/include/ui/sdl2.h
++++ b/include/ui/sdl2.h
+@@ -59,6 +59,10 @@ void sdl2_window_destroy(struct sdl2_console *scon);
+ void sdl2_window_resize(struct sdl2_console *scon);
+ void sdl2_poll_events(struct sdl2_console *scon);
+ 
++/* BVMGPU: sdl2-clipboard.c */
++void sdl2_clipboard_init(void);
++void sdl2_clipboard_changed(void);
++
+ void sdl2_process_key(struct sdl2_console *scon,
+                       SDL_KeyboardEvent *ev);
+ void sdl2_release_modifiers(struct sdl2_console *scon);
+@@ -96,5 +100,12 @@ void sdl2_gl_scanout_texture(DisplayChangeListener *dcl,
+                              ScanoutTextureNative native);
+ void sdl2_gl_scanout_flush(DisplayChangeListener *dcl,
+                            uint32_t x, uint32_t y, uint32_t w, uint32_t h);
++#ifdef CONFIG_GBM
++bool sdl2_gl_has_dmabuf(DisplayChangeListener *dcl);
++void sdl2_gl_scanout_dmabuf(DisplayChangeListener *dcl,
++                            QemuDmaBuf *dmabuf);
++void sdl2_gl_release_dmabuf(DisplayChangeListener *dcl,
++                            QemuDmaBuf *dmabuf);
++#endif
+ 
+ #endif /* SDL2_H */
+diff --git a/system/cpus.c b/system/cpus.c
+index 2cc5f88..cf3c81b 100644
+--- a/system/cpus.c
++++ b/system/cpus.c
+@@ -558,6 +558,21 @@ void bql_lock_impl(const char *file, int line)
+     set_bql_locked(true);
+ }
+ 
++/*
++ * BVMGPU: non-blocking BQL acquire for the audio pump IOThread. pause_all_vcpus() (shutdown, 'stop')
++ * disables QEMU_CLOCK_VIRTUAL and waits for running timer callbacks while holding the BQL, so a timer
++ * callback that blocks in bql_lock() deadlocks it (QEMU would not exit on Ctrl+C / window close).
++ */
++bool bvm_bql_trylock(void)
++{
++    g_assert(!bql_locked());
++    if (qemu_mutex_trylock(&bql)) {
++        return false;
++    }
++    set_bql_locked(true);
++    return true;
++}
++
+ void bql_unlock(void)
+ {
+     g_assert(bql_locked());
+diff --git a/ui/gtk-gl-area.c b/ui/gtk-gl-area.c
+index 6df1af1..0703135 100644
+--- a/ui/gtk-gl-area.c
++++ b/ui/gtk-gl-area.c
+@@ -37,6 +37,22 @@ static void gtk_gl_area_set_scanout_mode(VirtualConsole *vc, bool scanout)
+ 
+ /** DisplayState Callbacks (opengl version) **/
+ 
++/*
++ * BVM_GL_NOBLOCK=1: do not stall the virtio-gpu command queue while the
++ * display blit of a dmabuf scanout is in flight.  The guest GPU path relies
++ * on kernel implicit sync of the dmabuf instead.  Experiment.
++ */
++static bool gd_gl_area_noblock(void)
++{
++    static int state = -1;
++
++    if (state < 0) {
++        const char *e = getenv("BVM_GL_NOBLOCK");
++        state = (e && *e && *e != '0') ? 1 : 0;
++    }
++    return state;
++}
++
+ void gd_gl_area_draw(VirtualConsole *vc)
+ {
+ #ifdef CONFIG_GBM
+@@ -73,7 +89,9 @@ void gd_gl_area_draw(VirtualConsole *vc)
+             } else {
+                 qemu_dmabuf_set_draw_submitted(dmabuf, false);
+             }
+-            graphic_hw_gl_block(vc->gfx.dcl.con, true);
++            if (!gd_gl_area_noblock()) {
++                graphic_hw_gl_block(vc->gfx.dcl.con, true);
++            }
+         }
+ #endif
+ 
+@@ -93,7 +111,7 @@ void gd_gl_area_draw(VirtualConsole *vc)
+ #endif
+         glFlush();
+ #ifdef CONFIG_GBM
+-        if (dmabuf) {
++        if (dmabuf && !gd_gl_area_noblock()) {
+             int fence_fd;
+             /* a still-pending previous fence must be cancelled before
+              * egl_dmabuf_create_fence overwrites fence_fd, or its fd
+diff --git a/ui/meson.build b/ui/meson.build
+index 10eea7e..797589a 100644
+--- a/ui/meson.build
++++ b/ui/meson.build
+@@ -125,6 +125,7 @@ if sdl.found()
+   sdl_ss = ss.source_set()
+   sdl_ss.add(sdl, sdl_image, pixman, glib, files(
+     'sdl2-2d.c',
++    'sdl2-clipboard.c',
+     'sdl2-input.c',
+     'sdl2.c',
+   ))
+diff --git a/ui/sdl2-clipboard.c b/ui/sdl2-clipboard.c
+new file mode 100644
+index 0000000..9e3fce8
+--- /dev/null
++++ b/ui/sdl2-clipboard.c
+@@ -0,0 +1,106 @@
++/*
++ * SDL2 UI -- clipboard support (BVMGPU)
++ *
++ * The SDL2 display had no clipboard code, so the SPICE agent's clipboard (qemu-vdagent
++ * chardev, clipboard=on) did nothing with -display sdl. This is a text-only peer modelled on
++ * gtk-clipboard.c. SDL has no lazy "provide data on paste" API, so guest->host copies the
++ * text eagerly as soon as the guest announces it; host->guest announces on SDL_CLIPBOARDUPDATE
++ * and reads the text when the guest asks for it.
++ *
++ * This program is free software; you can redistribute it and/or modify
++ * it under the terms of the GNU General Public License as published by
++ * the Free Software Foundation; either version 2 of the License, or
++ * (at your option) any later version.
++ */
++
++#include "qemu/osdep.h"
++#include "ui/console.h"
++#include "ui/clipboard.h"
++#include "ui/sdl2.h"
++
++static QemuClipboardPeer sdl2_cbpeer;
++static char *sdl2_cb_last_set;  /* text we put into the host clipboard ourselves */
++
++static void sdl2_clipboard_update_info(QemuClipboardInfo *info)
++{
++    QemuClipboardSelection s = info->selection;
++    QemuClipboardInfo *cur = qemu_clipboard_info(s);
++
++    if (s != QEMU_CLIPBOARD_SELECTION_CLIPBOARD || info->owner == &sdl2_cbpeer) {
++        return;
++    }
++
++    if (info != cur) {
++        /* the guest grabbed the clipboard: fetch the text right away */
++        if (info->types[QEMU_CLIPBOARD_TYPE_TEXT].available &&
++            !info->types[QEMU_CLIPBOARD_TYPE_TEXT].data) {
++            qemu_clipboard_request(info, QEMU_CLIPBOARD_TYPE_TEXT);
++        }
++        return;
++    }
++
++    /* data for the current info arrived */
++    if (info->types[QEMU_CLIPBOARD_TYPE_TEXT].data) {
++        char *text = g_strndup(info->types[QEMU_CLIPBOARD_TYPE_TEXT].data,
++                               info->types[QEMU_CLIPBOARD_TYPE_TEXT].size);
++
++        g_free(sdl2_cb_last_set);
++        sdl2_cb_last_set = text;
++        SDL_SetClipboardText(text);
++    }
++}
++
++static void sdl2_clipboard_notify(Notifier *notifier, void *data)
++{
++    QemuClipboardNotify *notify = data;
++
++    if (notify->type == QEMU_CLIPBOARD_UPDATE_INFO) {
++        sdl2_clipboard_update_info(notify->info);
++    }
++}
++
++static void sdl2_clipboard_request(QemuClipboardInfo *info,
++                                   QemuClipboardType type)
++{
++    char *text;
++
++    if (type != QEMU_CLIPBOARD_TYPE_TEXT) {
++        return;
++    }
++    text = SDL_GetClipboardText();
++    if (text && text[0]) {
++        qemu_clipboard_set_data(&sdl2_cbpeer, info, type, strlen(text), text, true);
++    }
++    SDL_free(text);
++}
++
++/* SDL_CLIPBOARDUPDATE: the host clipboard changed (also fires for our own SDL_SetClipboardText) */
++void sdl2_clipboard_changed(void)
++{
++    QemuClipboardInfo *info;
++    char *text;
++
++    if (!SDL_HasClipboardText()) {
++        return;
++    }
++    text = SDL_GetClipboardText();
++    if (!text || !text[0] ||
++        (sdl2_cb_last_set && !strcmp(text, sdl2_cb_last_set))) {
++        SDL_free(text);
++        return;
++    }
++    SDL_free(text);
++
++    info = qemu_clipboard_info_new(&sdl2_cbpeer, QEMU_CLIPBOARD_SELECTION_CLIPBOARD);
++    info->types[QEMU_CLIPBOARD_TYPE_TEXT].available = true;
++    qemu_clipboard_update(info);
++    qemu_clipboard_info_unref(info);
++}
++
++void sdl2_clipboard_init(void)
++{
++    sdl2_cbpeer.name = "sdl2";
++    sdl2_cbpeer.notifier.notify = sdl2_clipboard_notify;
++    sdl2_cbpeer.request = sdl2_clipboard_request;
++    qemu_clipboard_peer_register(&sdl2_cbpeer);
++}
+diff --git a/ui/sdl2-gl.c b/ui/sdl2-gl.c
+index f2f7602..9ee524c 100644
+--- a/ui/sdl2-gl.c
++++ b/ui/sdl2-gl.c
+@@ -26,10 +26,53 @@
+  */
+ 
+ #include "qemu/osdep.h"
++#include "qemu/main-loop.h"
++#include "qemu/error-report.h"
++#include "qemu/timer.h"
+ #include "ui/console.h"
+ #include "ui/input.h"
+ #include "ui/sdl2.h"
+ 
++/*
++ * BVMGPU: SDL events are only read from sdl2_gl_refresh, which runs on the
++ * display refresh timer (30 ms, and much longer when the display core thinks the
++ * screen is idle, which it does with GL scanouts since they bypass the update
++ * calls). That adds up to a refresh interval of input latency compared with
++ * GTK. Poll the SDL event queue from a fast timer on the main loop instead
++ * (BVM_SDL_POLL_MS, default 4, 0 = off).
++ */
++static QEMUTimer *sdl2_poll_timer;
++static int64_t sdl2_poll_ms;
++
++static void sdl2_gl_poll_timer_cb(void *opaque)
++{
++    struct sdl2_console *scon = opaque;
++
++    if (scon->real_window) {
++        sdl2_poll_events(scon);
++    }
++    timer_mod(sdl2_poll_timer,
++              qemu_clock_get_ms(QEMU_CLOCK_REALTIME) + sdl2_poll_ms);
++}
++
++static void sdl2_gl_start_poll_timer(struct sdl2_console *scon)
++{
++    const char *env;
++
++    if (sdl2_poll_timer) {
++        return;
++    }
++    env = getenv("BVM_SDL_POLL_MS");
++    sdl2_poll_ms = env ? atoi(env) : 4;
++    if (sdl2_poll_ms <= 0) {
++        return;
++    }
++    sdl2_poll_timer = timer_new_ms(QEMU_CLOCK_REALTIME,
++                                   sdl2_gl_poll_timer_cb, scon);
++    timer_mod(sdl2_poll_timer,
++              qemu_clock_get_ms(QEMU_CLOCK_REALTIME) + sdl2_poll_ms);
++}
++
+ static void sdl2_set_scanout_mode(struct sdl2_console *scon, bool scanout)
+ {
+     if (scon->scanout_mode == scanout) {
+@@ -99,6 +142,9 @@ void sdl2_gl_switch(DisplayChangeListener *dcl,
+     if (!scon->real_window) {
+         sdl2_window_create(scon);
+         scon->gls = qemu_gl_init_shader();
++        if (qemu_console_get_index(dcl->con) == 0) {
++            sdl2_gl_start_poll_timer(scon);
++        }
+     } else if (old_surface &&
+                ((surface_width(old_surface)  != surface_width(new_surface)) ||
+                 (surface_height(old_surface) != surface_height(new_surface)))) {
+@@ -144,7 +190,11 @@ QEMUGLContext sdl2_gl_create_context(DisplayGLCtx *dgc,
+ 
+     assert(scon->opengl);
+ 
+-    SDL_GL_MakeCurrent(scon->real_window, scon->winctx);
++    /* BVMGPU: say why when this fails (a rare start where virglrenderer got no GL context left the guest waiting forever) */
++    if (SDL_GL_MakeCurrent(scon->real_window, scon->winctx) < 0) {
++        error_report("sdl2_gl_create_context: cannot make the window context current: %s (window %p, context %p)",
++                     SDL_GetError(), scon->real_window, scon->winctx);
++    }
+ 
+     SDL_GL_SetAttribute(SDL_GL_SHARE_WITH_CURRENT_CONTEXT, 1);
+     if (scon->opts->gl == DISPLAY_GL_MODE_ON ||
+@@ -168,6 +218,24 @@ QEMUGLContext sdl2_gl_create_context(DisplayGLCtx *dgc,
+                             SDL_GL_CONTEXT_PROFILE_ES);
+         ctx = SDL_GL_CreateContext(scon->real_window);
+     }
++    if (!ctx) {
++        error_report("sdl2_gl_create_context: SDL_GL_CreateContext failed for GL %d.%d: %s",
++                     params->major_ver, params->minor_ver, SDL_GetError());
++    }
++
++    /*
++     * BVMGPU: SDL_GL_CreateContext leaves the new context current on this
++     * thread, but virglrenderer's sync thread makes the contexts it creates
++     * current on ITS thread (surfaceless, see sdl2_gl_make_context_current),
++     * which EGL refuses while the context is still current here. Put the
++     * window context back and remember SDL's EGL display for the dmabuf import.
++     */
++#ifdef CONFIG_GBM
++    if (ctx && qemu_egl_display == EGL_NO_DISPLAY) {
++        qemu_egl_display = eglGetCurrentDisplay();
++    }
++#endif
++    SDL_GL_MakeCurrent(scon->real_window, scon->winctx);
+     return (QEMUGLContext)ctx;
+ }
+ 
+@@ -186,7 +254,28 @@ int sdl2_gl_make_context_current(DisplayGLCtx *dgc,
+ 
+     assert(scon->opengl);
+ 
+-    return SDL_GL_MakeCurrent(scon->real_window, sdlctx);
++    /*
++     * BVMGPU: virglrenderer's sync thread (no BQL) binds its context without a
++     * surface. SDL_GL_MakeCurrent needs the window and would collide with the
++     * main thread, so use EGL directly there. SDL's EGL backends use the
++     * EGLContext itself as SDL_GLContext. The main thread keeps using SDL so
++     * SDL's current-context bookkeeping stays right.
++     */
++    if (!bql_locked() && qemu_egl_display != EGL_NO_DISPLAY) {
++        if (!eglMakeCurrent(qemu_egl_display, EGL_NO_SURFACE, EGL_NO_SURFACE,
++                            sdlctx ? (EGLContext)sdlctx : EGL_NO_CONTEXT)) {
++            error_report("sdl2_gl_make_context_current: eglMakeCurrent failed: EGL error 0x%x", eglGetError());
++            return -1;
++        }
++        return 0;
++    }
++
++    int ret = SDL_GL_MakeCurrent(scon->real_window, sdlctx);
++    if (ret < 0) {
++        error_report("sdl2_gl_make_context_current: SDL_GL_MakeCurrent failed: %s (window %p, context %p)",
++                     SDL_GetError(), scon->real_window, sdlctx);
++    }
++    return ret;
+ }
+ 
+ void sdl2_gl_scanout_disable(DisplayChangeListener *dcl)
+@@ -247,3 +336,79 @@ void sdl2_gl_scanout_flush(DisplayChangeListener *dcl,
+ 
+     SDL_GL_SwapWindow(scon->real_window);
+ }
++
++#ifdef CONFIG_GBM
++/*
++ * BVMGPU: dmabuf scanout for the SDL2 GL display, modelled on gtk-egl.c.
++ * With SDL on Wayland (or KMSDRM) SDL_GL_SwapWindow is a plain eglSwapBuffers
++ * that hands a dmabuf to the compositor, so there is no GPU->CPU readback and
++ * no wl_shm upload as with GtkGLArea. The guest dmabuf is imported as a GL
++ * texture on SDL's own EGL display and blitted into the window.
++ *
++ * No fence is created for the guest dmabuf (guest_fb.dmabuf stays NULL): like
++ * BVM_GL_NOBLOCK this relies on the kernel's implicit dmabuf synchronisation
++ * between the blit (reader) and the guest's next render (writer).
++ */
++static bool sdl2_gl_egl_display_init(struct sdl2_console *scon)
++{
++    if (!scon->real_window || !scon->winctx) {
++        return false;
++    }
++
++    SDL_GL_MakeCurrent(scon->real_window, scon->winctx);
++    if (qemu_egl_display == EGL_NO_DISPLAY) {
++        qemu_egl_display = eglGetCurrentDisplay();
++    }
++    return qemu_egl_display != EGL_NO_DISPLAY;
++}
++
++bool sdl2_gl_has_dmabuf(DisplayChangeListener *dcl)
++{
++    struct sdl2_console *scon = container_of(dcl, struct sdl2_console, dcl);
++
++    return sdl2_gl_egl_display_init(scon) && qemu_egl_has_dmabuf();
++}
++
++void sdl2_gl_scanout_dmabuf(DisplayChangeListener *dcl,
++                            QemuDmaBuf *dmabuf)
++{
++    struct sdl2_console *scon = container_of(dcl, struct sdl2_console, dcl);
++    uint32_t x, y, width, height, backing_width, backing_height, texture;
++    bool y0_top;
++
++    assert(scon->opengl);
++
++    if (!sdl2_gl_egl_display_init(scon)) {
++        return;
++    }
++
++    egl_dmabuf_import_texture(dmabuf);
++    texture = qemu_dmabuf_get_texture(dmabuf);
++    if (!texture) {
++        return;
++    }
++
++    x = qemu_dmabuf_get_x(dmabuf);
++    y = qemu_dmabuf_get_y(dmabuf);
++    width = qemu_dmabuf_get_width(dmabuf);
++    height = qemu_dmabuf_get_height(dmabuf);
++    backing_width = qemu_dmabuf_get_backing_width(dmabuf);
++    backing_height = qemu_dmabuf_get_backing_height(dmabuf);
++    y0_top = qemu_dmabuf_get_y0_top(dmabuf);
++
++    sdl2_gl_scanout_texture(dcl, texture, y0_top, backing_width,
++                            backing_height, x, y, width, height,
++                            NO_NATIVE_TEXTURE);
++}
++
++void sdl2_gl_release_dmabuf(DisplayChangeListener *dcl,
++                            QemuDmaBuf *dmabuf)
++{
++    struct sdl2_console *scon = container_of(dcl, struct sdl2_console, dcl);
++
++    if (scon->real_window && scon->winctx) {
++        SDL_GL_MakeCurrent(scon->real_window, scon->winctx);
++    }
++    egl_dmabuf_release_texture(dmabuf);
++}
++#endif
+diff --git a/ui/sdl2.c b/ui/sdl2.c
+index a7e3391..8e8185a 100644
+--- a/ui/sdl2.c
++++ b/ui/sdl2.c
+@@ -76,6 +76,43 @@ static struct sdl2_console *get_scon_from_window(uint32_t window_id)
+     return NULL;
+ }
+ 
++/*
++ * BVMGPU: tell the guest the real refresh rate of the host display (as the GTK
++ * backend does). Without it the virtio-gpu EDID defaults to 75 Hz, the Triton
++ * driver ticks its vsync at 75 Hz (13.3 ms) and the guest beats against the
++ * 60 Hz output. BVM_GUEST_HZ=<n> overrides it (testing).
++ */
++static uint32_t sdl2_refresh_rate_mhz(struct sdl2_console *scon)
++{
++    const char *env = getenv("BVM_GUEST_HZ");
++    SDL_DisplayMode mode;
++    int idx;
++
++    if (env && atoi(env) > 0) {
++        return atoi(env) * 1000;
++    }
++    if (!scon->real_window) {
++        return 0;
++    }
++    idx = SDL_GetWindowDisplayIndex(scon->real_window);
++    if (idx >= 0 && SDL_GetCurrentDisplayMode(idx, &mode) == 0 &&
++        mode.refresh_rate > 0) {
++        return mode.refresh_rate * 1000;
++    }
++    return 0;
++}
++
++static void sdl2_send_ui_info(struct sdl2_console *scon, int w, int h)
++{
++    QemuUIInfo info;
++
++    memset(&info, 0, sizeof(info));
++    info.width = w;
++    info.height = h;
++    info.refresh_rate = sdl2_refresh_rate_mhz(scon);
++    dpy_set_ui_info(scon->dcl.con, &info, true);
++}
++
+ void sdl2_window_create(struct sdl2_console *scon)
+ {
+     int flags = 0;
+@@ -123,6 +160,12 @@ void sdl2_window_create(struct sdl2_console *scon)
+         scon->real_renderer = SDL_CreateRenderer(scon->real_window, -1, 0);
+     }
+     sdl_update_caption(scon);
++    {
++        int ww, wh;
++
++        SDL_GetWindowSize(scon->real_window, &ww, &wh);
++        sdl2_send_ui_info(scon, ww, wh);
++    }
+ }
+ 
+ void sdl2_window_destroy(struct sdl2_console *scon)
+@@ -592,13 +635,7 @@ static void handle_windowevent(SDL_Event *ev)
+ 
+     switch (ev->window.event) {
+     case SDL_WINDOWEVENT_RESIZED:
+-        {
+-            QemuUIInfo info;
+-            memset(&info, 0, sizeof(info));
+-            info.width = ev->window.data1;
+-            info.height = ev->window.data2;
+-            dpy_set_ui_info(scon->dcl.con, &info, true);
+-        }
++        sdl2_send_ui_info(scon, ev->window.data1, ev->window.data2);
+         sdl2_redraw(scon);
+         break;
+     case SDL_WINDOWEVENT_EXPOSED:
+@@ -703,6 +740,9 @@ void sdl2_poll_events(struct sdl2_console *scon)
+         case SDL_WINDOWEVENT:
+             handle_windowevent(ev);
+             break;
++        case SDL_CLIPBOARDUPDATE:
++            sdl2_clipboard_changed();
++            break;
+         default:
+             break;
+         }
+@@ -810,6 +850,11 @@ static const DisplayChangeListenerOps dcl_gl_ops = {
+     .dpy_gl_scanout_disable  = sdl2_gl_scanout_disable,
+     .dpy_gl_scanout_texture  = sdl2_gl_scanout_texture,
+     .dpy_gl_update           = sdl2_gl_scanout_flush,
++#ifdef CONFIG_GBM
++    .dpy_gl_scanout_dmabuf   = sdl2_gl_scanout_dmabuf,
++    .dpy_gl_release_dmabuf   = sdl2_gl_release_dmabuf,
++    .dpy_has_dmabuf          = sdl2_gl_has_dmabuf,
++#endif
+ };
+ 
+ static bool
+@@ -941,6 +986,8 @@ static void sdl2_display_init(DisplayState *ds, DisplayOptions *o)
+         SDL_SetWindowIcon(sdl2_console[0].real_window, icon);
+     }
+ 
++    sdl2_clipboard_init();
++
+     mouse_mode_notifier.notify = sdl_mouse_mode_change;
+     qemu_add_mouse_mode_change_notifier(&mouse_mode_notifier);
+ 

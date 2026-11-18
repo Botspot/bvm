@@ -75,8 +75,29 @@ if (Test-Path $DebloatScript) {
     Write-Output "WARNING: Debloat script not found at $DebloatScript"
 }
 
-# Shutdown after completion
-Execute-Command 'shutdown.exe -s -t 60 -c "First-run setup complete. This VM will SHUTDOWN in 60 seconds"'
+# Everything above is for this VM only once. What follows is the setup of BVM's display modes without RDP (host folder as Z:, clipboard, automatic login, power settings,
+# GPU driver). It can run again later, so it is a separate file: C:\bvm\guest-setup.cmd. The host puts it in the folder bvm of the unattended drive, if it could download
+# the drivers; without it, the host does the same later with the command gpu-firstboot.
+$GuestSetup = "E:\bvm\guest-setup.cmd"
+if (Test-Path $GuestSetup) {
+    Write-Output "Installing the BVM guest setup..."
+    Execute-Command 'xcopy E:\bvm C:\bvm /e /i /y /q'
+    Execute-Command 'attrib -r C:\bvm\*.* /s'
+    # the launcher in the Startup folder continues the setup after a restart (the GPU driver needs one). firstboot.flag: no waiting for a key press if it fails.
+    $Launcher = "$env:ProgramData\Microsoft\Windows\Start Menu\Programs\StartUp\bvm-guest-setup.cmd"
+    Set-Content -Path $Launcher -Encoding ASCII -Value '@echo off', 'if exist C:\bvm\guest-setup.cmd (copy /y C:\bvm\guest-setup.cmd C:\Windows\Temp\bvm-setup.cmd >nul & call C:\Windows\Temp\bvm-setup.cmd)'
+    Set-Content -Path 'C:\bvm\firstboot.flag' -Value 'first boot of a new VM'
+    Set-Content -Path 'C:\bvm\shutdown-when-done.flag' -Value 'shut down when the guest setup is done'
+    Copy-Item 'C:\bvm\guest-setup.cmd' 'C:\Windows\Temp\bvm-setup.cmd' -Force
+    # runs in this window, and shuts Windows down itself when it is done (or restarts it first)
+    cmd.exe /c 'C:\Windows\Temp\bvm-setup.cmd'
+    Write-Output "The guest setup returned: $LASTEXITCODE"
+    # if it did not shut down by itself (it failed), do it here
+    shutdown.exe -s -t 60 -c "First-run setup complete. This VM will SHUTDOWN in 60 seconds" 2>&1 | Out-Null
+} else {
+    # Shutdown after completion
+    Execute-Command 'shutdown.exe -s -t 60 -c "First-run setup complete. This VM will SHUTDOWN in 60 seconds"'
+}
 
 # Stop logging
 Stop-Transcript
