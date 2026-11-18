@@ -2,7 +2,7 @@
 ![BVM](https://raw.githubusercontent.com/Botspot/bvm/refs/heads/main/resources/graphics/icon-128.png)  
 ## Botspot Virtual Machine - Windows 11 QEMU KVM on ARM Linux  
 ![20250304_01h53m41s_grim](https://github.com/user-attachments/assets/7b368dad-eb80-4579-be2e-12a737819f24)  
-The Pi 5 just became a much more capable desktop replacement. [See how I'm using BVM for class.](https://github.com/Botspot/bvm/discussions/39)  
+The Pi 5 just became a much more capable desktop replacement.  
 Please [report](https://github.com/Botspot/bvm/issues) issues. Do not assume I am already aware of an issue, unless you can find an existing issue report, in which case please comment with something like "I'm having this problem too."  
 
 ### What to expect:
@@ -94,7 +94,7 @@ GPU mode lets Windows draw with the GPU of your board. The pieces: the [Triton](
 - It is experimental. Expect rough edges, and please report what you find.
 - It has only been tested on a Raspberry Pi 5 on a Wayland desktop. Other boards with a Vulkan-capable GPU and kernel 6.12 or newer might work: please tell me how it went, a Pi 4 is next on my list. BVM only warns on boards it has not seen.
 - DirectX 11 only (no DirectX 12), and the screen runs at 30 frames per second, which is what a Pi's GPU can keep up with. Windows uses the unfinished pre-release Triton driver.
-- The first build takes **1 to 2 hours** and needs about **15 GB of free space** in the VM folder while it works (about 0.6 GB stay afterwards). You will be asked for your password once, to install the build packages.
+- The first build takes **1 to 2 hours** and needs about **15 GB of free space** in the VM folder while it works (about 0.6 GB stay afterwards).
 
 **How to use it:**
 - *New VM:* nothing special. `firstboot` already installed the GPU driver and the rest of the guest setup in Windows. Run `bvm/bvm gpu-setup ~/win11` to build the host side, then `bvm/bvm boot-gpu ~/win11`.
@@ -119,9 +119,8 @@ GPU mode lets Windows draw with the GPU of your board. The pieces: the [Triton](
 ### Tips:
 - Use an ARM 64-bit Linux OS with the `kvm` kernel module enabled. This is a hard requirement.
 - Use Wayland. This is not a hard requirement, but it makes a big difference. (GPU mode was only tested on Wayland.)
-- Use ZRAM to avoid running out of RAM as easily. This is basically a hard requirement if you have a 1GB or 2GB Pi model, but strongly recommended everywhere. [Instructions here.](https://pi-apps.io/install-app/install-more-ram-on-raspberry-pi/) It also helps a lot when compiling GPU mode.
-- Use Debian Bookworm or a new-ish Ubuntu image. Debian Bullseye may or may not work. If you try it, please let me know how it went. Maybe it works fine.
-- To make `disk.qcow2` smaller after deleting lots of files in Windows: write zeros over the free space in Windows (for example with Sysinternals SDelete and its `-z` option), then shut down. BVM passes zeroes through to the image, which frees that space on your Linux disk. It cannot free everything, because the image grows and shrinks in 2 MiB pieces.
+- Use ZRAM to avoid running out of RAM as easily. This is basically a hard requirement if you have a 4GB Pi model, but strongly recommended everywhere. [Instructions here.](https://pi-apps.io/install-app/install-more-ram-on-raspberry-pi/) It also helps a lot when compiling GPU mode.
+- Use Debian Bookworm, Trixie, or an Ubuntu image from 2024 or newer.
 - Some questions keep being asked. "How to use my own Windows ISO?" "How to change the drive size or the language or the screen resolution?" [Find the answers here.](https://github.com/Botspot/bvm/discussions/35)
 - Encounter an issue? [Open an issue.](https://github.com/Botspot/bvm/issues) Deal? Deal. :)
 - Please post how you use BVM in [the Show-And-Tell](https://github.com/Botspot/bvm/discussions/categories/show-and-tell)!
