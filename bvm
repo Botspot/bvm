@@ -691,7 +691,12 @@ qemu_newer_than() { #check if QEMU is newer than specified version, return 0 if 
 
 update_check() { #check for updates and reload the script if necessary
   localhash="$(cd "$DIRECTORY" ; git rev-parse HEAD)"
-  latesthash="$(git ls-remote https://github.com/Botspot/bvm HEAD | awk '{print $1}')"
+  #compare with the branch that is checked out, not with the default branch of the repository: whoever tests another branch (it is what git pull below updates) would otherwise be told about an update at every run
+  local branch="$(cd "$DIRECTORY" ; git symbolic-ref --short -q HEAD)"
+  [ -z "$branch" ] && return 0 #a detached HEAD does not follow anything
+  latesthash="$(git ls-remote https://github.com/Botspot/bvm "refs/heads/$branch" | awk '{print $1}')"
+  #a local copy that already has the latest commit, with newer commits of its own on top, is not out of date (and git restore below must never touch the work of a developer)
+  (cd "$DIRECTORY" ; git merge-base --is-ancestor "$latesthash" "$localhash" 2>/dev/null) && return 0
   if [ "$localhash" != "$latesthash" ] && [ ! -z "$latesthash" ] && [ ! -z "$localhash" ];then
     if [ "$disable_updates" == true ];then
       echo "Updates available, but you have auto-updates disabled."
