@@ -1,7 +1,10 @@
 <a href="https://github.com/Botspot/pi-apps"><img src="https://github.com/Botspot/pi-apps/blob/master/icons/badge.png?raw=true" align="right"/></a>
 ![BVM](https://raw.githubusercontent.com/Botspot/bvm/refs/heads/main/resources/graphics/icon-128.png)  
 ## Botspot Virtual Machine - Windows 11 QEMU KVM on ARM Linux  
-![20250304_01h53m41s_grim](https://github.com/user-attachments/assets/7b368dad-eb80-4579-be2e-12a737819f24)  
+<img width="816" height="655" alt="image" src="https://github.com/user-attachments/assets/51b2a1d6-fc6e-4cf8-a44b-a607abf77884" />
+
+![20250304_01h53m41s_grim](https://github.com/user-attachments/assets/8b8e10e6-ca1b-474f-a002-c345e73f23e7)  
+
 The Pi 5 just became a much more capable desktop replacement.  
 Please [report](https://github.com/Botspot/bvm/issues) issues. Do not assume I am already aware of an issue, unless you can find an existing issue report, in which case please comment with something like "I'm having this problem too."  
 
